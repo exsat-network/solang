@@ -216,8 +216,8 @@ impl<'a> TargetRuntime<'a> for AntelopeTarget {
             .unwrap()
             .into_int_value();
 
-        // Read row data: [pk: u64, slot_hash: checksum256, value: N bytes].
-        let row_size = 8 + 32 + byte_size; // pk(8) + hash(32) + value(N)
+        // Read row data: [pk: u64, slot_hash: checksum256, varuint32(len), value: N bytes].
+        let row_size = 8 + 32 + 1 + byte_size; // pk(8) + hash(32) + varuint(1) + value(N)
         let row_buf = bin
             .builder
             .build_array_alloca(
@@ -240,13 +240,13 @@ impl<'a> TargetRuntime<'a> for AntelopeTarget {
             )
             .unwrap();
 
-        // Value starts at offset 40 (after pk + slot_hash).
+        // Value starts at offset 41 (after pk + slot_hash + varuint32 length byte).
         let val_ptr = unsafe {
             bin.builder
                 .build_gep(
                     bin.context.i8_type(),
                     row_buf,
-                    &[i32_ty.const_int(40, false)],
+                    &[i32_ty.const_int(41, false)],
                     "val_ptr",
                 )
                 .unwrap()
@@ -392,9 +392,11 @@ impl<'a> TargetRuntime<'a> for AntelopeTarget {
             .unwrap();
         bin.builder.build_store(slot_buf, slot_i256).unwrap();
 
-        // Row format: [pk: u64, slot_hash: checksum256, value: N bytes].
+        // Row format: [pk: u64, slot_hash: checksum256, varuint32(value_len), value: N bytes].
+        // For fixed-size values (≤32 bytes), varuint32 is 1 byte.
         let val_ty = bin.context.custom_width_int_type(bits);
-        let row_size = 8 + 32 + byte_size; // pk(8) + hash(32) + value(N)
+        assert!(byte_size <= 127, "fixed-size value too large for 1-byte varuint32");
+        let row_size = 8 + 32 + 1 + byte_size; // pk(8) + hash(32) + varuint(1) + value(N)
         let row_buf = bin
             .builder
             .build_array_alloca(
@@ -417,13 +419,28 @@ impl<'a> TargetRuntime<'a> for AntelopeTarget {
         };
         bin.builder.build_store(hash_ptr, slot_i256).unwrap();
 
-        // Write value at offset 40 (8 + 32).
-        let val_ptr = unsafe {
+        // Write varuint32 length at offset 40.
+        let len_ptr = unsafe {
             bin.builder
                 .build_gep(
                     bin.context.i8_type(),
                     row_buf,
                     &[i32_ty.const_int(40, false)],
+                    "len_ptr",
+                )
+                .unwrap()
+        };
+        bin.builder
+            .build_store(len_ptr, bin.context.i8_type().const_int(byte_size as u64, false))
+            .unwrap();
+
+        // Write value at offset 41 (8 + 32 + 1).
+        let val_ptr = unsafe {
+            bin.builder
+                .build_gep(
+                    bin.context.i8_type(),
+                    row_buf,
+                    &[i32_ty.const_int(41, false)],
                     "val_ptr",
                 )
                 .unwrap()
@@ -1227,8 +1244,9 @@ impl AntelopeTarget {
             .unwrap();
         bin.builder.build_store(slot_buf, slot_i256).unwrap();
 
-        // Row size = 8 (pk) + 32 (hash) + string_len.
-        let header_size = i32_ty.const_int(40, false);
+        // Row size = 8 (pk) + 32 (hash) + 1 (varuint32 len) + string_len.
+        // Note: varuint32 is 1 byte for lengths < 128. Strings > 127 bytes not yet supported.
+        let header_size = i32_ty.const_int(41, false); // pk(8) + hash(32) + varuint(1)
         let row_size = bin
             .builder
             .build_int_add(header_size, string_len, "row_size")
@@ -1253,7 +1271,19 @@ impl AntelopeTarget {
         };
         bin.builder.build_store(hash_ptr, slot_i256).unwrap();
 
-        // Copy string bytes at offset 40.
+        // Write varuint32 length byte at offset 40.
+        let len_ptr = unsafe {
+            bin.builder
+                .build_gep(bin.context.i8_type(), row_buf, &[i32_ty.const_int(40, false)], "len_ptr")
+                .unwrap()
+        };
+        let len_byte = bin
+            .builder
+            .build_int_truncate(string_len, bin.context.i8_type(), "len_byte")
+            .unwrap();
+        bin.builder.build_store(len_ptr, len_byte).unwrap();
+
+        // Copy string bytes at offset 41.
         let val_ptr = unsafe {
             bin.builder
                 .build_gep(bin.context.i8_type(), row_buf, &[header_size], "val_ptr")
@@ -1505,8 +1535,8 @@ impl AntelopeTarget {
             .unwrap()
             .into_int_value();
 
-        // String length = row_total_size - 40 (pk + hash header).
-        let header_size = i32_ty.const_int(40, false);
+        // String length = row_total_size - 41 (pk:8 + hash:32 + varuint32_len:1).
+        let header_size = i32_ty.const_int(41, false);
         let str_len = bin
             .builder
             .build_int_sub(row_total_size, header_size, "str_len")
@@ -1537,7 +1567,7 @@ impl AntelopeTarget {
             .build_call(db_get, &[pri_iter2.into(), row_buf.into(), row_total_size.into()], "")
             .unwrap();
 
-        // String data starts at offset 40.
+        // String data starts at offset 41 (after pk:8 + hash:32 + varuint32:1).
         let str_ptr = unsafe {
             bin.builder
                 .build_gep(bin.context.i8_type(), row_buf, &[header_size], "str_ptr")

@@ -125,7 +125,7 @@ pub fn gen_abi(contract_no: usize, ns: &Namespace) -> AntelopeAbi {
 
     // Add the "state" table entry so explorers can decode storage.
     // Storage model: auto-increment primary key, idx256 secondary index for slot lookup.
-    // Row data = raw value bytes only. For the POC, value is uint64.
+    // Row data = raw value bytes (variable length: uint64, uint256, strings, etc.).
     let has_state_vars = !contract.variables.iter().all(|v| v.constant);
     let mut tables = Vec::new();
 
@@ -144,7 +144,7 @@ pub fn gen_abi(contract_no: usize, ns: &Namespace) -> AntelopeAbi {
                 },
                 AbiField {
                     name: "value".to_string(),
-                    ty: "uint64".to_string(),
+                    ty: "bytes".to_string(),
                 },
             ],
         });
