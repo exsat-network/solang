@@ -6,9 +6,10 @@ use crate::codegen::Options;
 use crate::emit::binary::Binary;
 use crate::emit::cfg::emit_cfg;
 use crate::sema::ast;
+use crate::sema::ast::Type;
 use inkwell::context::Context;
 use inkwell::module::{Linkage, Module};
-use inkwell::values::GlobalValue;
+use inkwell::values::{BasicMetadataValueEnum, GlobalValue};
 use inkwell::AddressSpace;
 use inkwell::IntPredicate;
 
@@ -133,6 +134,22 @@ impl AntelopeTarget {
             i32_ty.fn_type(&[i32_ty.into(), ptr_ty.into(), i32_ty.into()], false);
         bin.module
             .add_function("db_get_i64", db_get_ty, Some(Linkage::External));
+
+        // uint32_t action_data_size()
+        let action_data_size_ty = i32_ty.fn_type(&[], false);
+        bin.module.add_function(
+            "action_data_size",
+            action_data_size_ty,
+            Some(Linkage::External),
+        );
+
+        // uint32_t read_action_data(void* msg, uint32_t len)
+        let read_action_data_ty = i32_ty.fn_type(&[ptr_ty.into(), i32_ty.into()], false);
+        bin.module.add_function(
+            "read_action_data",
+            read_action_data_ty,
+            Some(Linkage::External),
+        );
     }
 
     /// Add a WASM global to store the `receiver` account name (set in apply()).
@@ -172,6 +189,25 @@ impl AntelopeTarget {
 
         for (func_decl, cfg) in defines {
             emit_cfg(&mut AntelopeTarget, bin, contract, cfg, func_decl);
+        }
+    }
+
+    /// Compute the byte size of a type in Antelope DataStream serialization.
+    /// DataStream uses packed little-endian format: uint8=1, uint64=8, uint256=32, etc.
+    fn datastream_byte_size(ty: &Type, bin: &Binary) -> u32 {
+        match ty {
+            Type::Bool => 1,
+            Type::Uint(n) | Type::Int(n) => ((*n as u32) + 7) / 8,
+            Type::Bytes(n) => *n as u32,
+            Type::Enum(n) => {
+                let bits = bin.ns.enums[*n].ty.bits(bin.ns) as u32;
+                (bits + 7) / 8
+            }
+            Type::Value => bin.ns.value_length as u32,
+            Type::Contract(_) | Type::Address(_) => bin.ns.address_length as u32,
+            _ => panic!(
+                "Antelope: unsupported parameter type for action data deserialization: {ty:?}"
+            ),
         }
     }
 
@@ -239,8 +275,8 @@ impl AntelopeTarget {
                 continue;
             }
 
-            // Strip "function::" prefix pattern: "Contract::Contract::function::name"
-            let action_name = func_name;
+            // Strip mangled parameter suffix: "record__uint64_uint64" → "record"
+            let action_name = func_name.split("__").next().unwrap_or(func_name);
             let action_encoded = string_to_name(action_name);
 
             let action_const = i64_ty.const_int(action_encoded, false);
@@ -260,11 +296,78 @@ impl AntelopeTarget {
             bin.builder.position_at_end(call_bb);
 
             if let Some(func) = bin.module.get_function(&cfg.name) {
-                // For now, only call functions with no parameters.
-                // TODO: deserialize action data for functions with parameters.
-                if cfg.params.is_empty() {
-                    bin.builder.build_call(func, &[], "").unwrap();
+                let mut args: Vec<BasicMetadataValueEnum> = Vec::new();
+
+                if !cfg.params.is_empty() {
+                    // Read raw action data into a stack buffer.
+                    let i32_ty = context.i32_type();
+                    let data_size_fn =
+                        bin.module.get_function("action_data_size").unwrap();
+                    let data_size = bin
+                        .builder
+                        .build_call(data_size_fn, &[], "data_size")
+                        .unwrap()
+                        .try_as_basic_value()
+                        .left()
+                        .unwrap()
+                        .into_int_value();
+
+                    let data_buf = bin
+                        .builder
+                        .build_array_alloca(
+                            context.i8_type(),
+                            data_size,
+                            "action_data",
+                        )
+                        .unwrap();
+
+                    let read_fn =
+                        bin.module.get_function("read_action_data").unwrap();
+                    bin.builder
+                        .build_call(
+                            read_fn,
+                            &[data_buf.into(), data_size.into()],
+                            "",
+                        )
+                        .unwrap();
+
+                    // Deserialize each parameter: packed little-endian integers.
+                    let mut offset: u32 = 0;
+                    for param in cfg.params.iter() {
+                        let byte_size = Self::datastream_byte_size(&param.ty, bin);
+                        let llvm_ty = bin.llvm_var_ty(&param.ty);
+
+                        let param_ptr = unsafe {
+                            bin.builder
+                                .build_gep(
+                                    context.i8_type(),
+                                    data_buf,
+                                    &[i32_ty.const_int(offset as u64, false)],
+                                    "param_ptr",
+                                )
+                                .unwrap()
+                        };
+
+                        let param_val = bin
+                            .builder
+                            .build_load(llvm_ty, param_ptr, "param")
+                            .unwrap();
+                        args.push(param_val.into());
+
+                        offset += byte_size;
+                    }
                 }
+
+                // Add output pointers for return values (passed by pointer).
+                for ret in cfg.returns.iter() {
+                    let ret_alloca = bin
+                        .builder
+                        .build_alloca(bin.llvm_var_ty(&ret.ty), "ret")
+                        .unwrap();
+                    args.push(ret_alloca.into());
+                }
+
+                bin.builder.build_call(func, &args, "").unwrap();
             }
             bin.builder.build_unconditional_branch(return_bb).unwrap();
 
