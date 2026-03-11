@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::sema::ast::{ArrayLength, CallArgs, Expression, Namespace, Note, RetrieveType, Type};
+use crate::Target;
 use crate::sema::diagnostics::Diagnostics;
 use crate::sema::expression::function_call::{
     collect_call_args, evaluate_argument, parse_call_args,
@@ -27,6 +28,15 @@ fn constructor(
     symtable: &mut Symtable,
     diagnostics: &mut Diagnostics,
 ) -> Result<Expression, ()> {
+    if ns.target == Target::Antelope {
+        diagnostics.push(Diagnostic::error(
+            *loc,
+            "dynamic contract creation with 'new' is not supported on Antelope. Deploy contracts separately."
+                .to_string(),
+        ));
+        return Err(());
+    }
+
     if !ns.contracts[no].instantiable {
         diagnostics.push(Diagnostic::error(
             *loc,

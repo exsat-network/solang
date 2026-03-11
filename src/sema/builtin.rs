@@ -36,7 +36,7 @@ pub struct Prototype {
 }
 
 // A list of all Solidity builtins functions
-pub static BUILTIN_FUNCTIONS: Lazy<[Prototype; 31]> = Lazy::new(|| { // 29 original + 2 Antelope
+pub static BUILTIN_FUNCTIONS: Lazy<[Prototype; 32]> = Lazy::new(|| { // 29 original + 3 Antelope
     [
         Prototype {
             builtin: Builtin::ExtendInstanceTtl,
@@ -390,6 +390,17 @@ pub static BUILTIN_FUNCTIONS: Lazy<[Prototype; 31]> = Lazy::new(|| { // 29 origi
             target: vec![Target::Antelope],
             doc: "Returns the current contract's Antelope account name as uint64.",
             constant: false,
+        },
+        Prototype {
+            builtin: Builtin::AntelopeName,
+            namespace: Some("antelope"),
+            method: vec![],
+            name: "name",
+            params: vec![Type::String],
+            ret: vec![Type::Uint(64)],
+            target: vec![Target::Antelope],
+            doc: "Encode a string literal as an Antelope eosio::name uint64 at compile time.",
+            constant: true,
         },
     ]
 });
@@ -961,6 +972,14 @@ pub fn builtin_var(
                     *loc,
                     String::from(
                         "Solana Cross Program Invocation (CPI) cannot transfer native value. See https://solang.readthedocs.io/en/latest/language/functions.html#value_transfer",
+                    ),
+                ));
+            }
+            if ns.target == Target::Antelope && p.builtin == Builtin::Value {
+                diagnostics.push(Diagnostic::error(
+                    *loc,
+                    String::from(
+                        "Antelope does not support value transfers in calls. Use explicit token transfer actions instead.",
                     ),
                 ));
             }

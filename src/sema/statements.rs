@@ -830,6 +830,14 @@ fn statement(
             flags,
             block,
         } => {
+            if ns.target == Target::Antelope {
+                ns.diagnostics.push(Diagnostic::error(
+                    *loc,
+                    "inline assembly is not supported on Antelope. Use antelope.* builtins instead."
+                        .to_string(),
+                ));
+                return Err(());
+            }
             if dialect.is_some() && dialect.as_ref().unwrap().string != "evmasm" {
                 ns.diagnostics.push(Diagnostic::error(
                     dialect.as_ref().unwrap().loc,

@@ -480,9 +480,29 @@ pub fn contract_function(
     fdecl.is_override = is_override;
     fdecl.has_body = func.body.is_some();
 
+    // Antelope does not support payable functions.
+    if ns.target == Target::Antelope && fdecl.is_payable() {
+        ns.diagnostics.push(Diagnostic::error(
+            func.loc_prototype,
+            "Antelope does not support payable functions. Use explicit token transfer actions instead."
+                .to_string(),
+        ));
+        return None;
+    }
+
     function_prototype_annotations(&mut fdecl, annotations, ns);
 
     if func.ty == pt::FunctionTy::Constructor {
+        // Antelope has no deploy-time initialization.
+        if ns.target == Target::Antelope {
+            ns.diagnostics.push(Diagnostic::error(
+                func.loc_prototype,
+                "constructors are not supported on Antelope. Use an explicit init() action instead."
+                    .to_string(),
+            ));
+            return None;
+        }
+
         // In the eth solidity only one constructor is allowed
         if ns.target == Target::EVM {
             if let Some(prev_func_no) = ns.contracts[contract_no]
@@ -640,6 +660,20 @@ pub fn contract_function(
         let func_no = ns.functions.len();
 
         ns.functions.push(fdecl);
+
+        // Warn about return values on Antelope — inline actions cannot return data.
+        if ns.target == Target::Antelope {
+            let f = &ns.functions[func_no];
+            if f.is_public() && !f.returns.is_empty() {
+                ns.diagnostics.push(Diagnostic::warning(
+                    func.loc_prototype,
+                    "return values on public functions are ignored on Antelope. \
+                     Use state variables or events to communicate results."
+                        .to_string(),
+                ));
+            }
+        }
+
         ns.contracts[contract_no].functions.push(func_no);
 
         if let Some(Symbol::Function(ref mut v)) =

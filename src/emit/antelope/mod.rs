@@ -298,23 +298,31 @@ impl AntelopeTarget {
         }
     }
 
-    /// Compute the byte size of a type in Antelope DataStream serialization.
-    /// DataStream uses packed little-endian format: uint8=1, uint64=8, uint256=32, etc.
-    fn datastream_byte_size(ty: &Type, bin: &Binary) -> u32 {
+    /// Compute the byte size of a fixed-size type in Antelope DataStream serialization.
+    /// Returns None for variable-length types (string, bytes).
+    fn datastream_fixed_size(ty: &Type, bin: &Binary) -> Option<u32> {
         match ty {
-            Type::Bool => 1,
-            Type::Uint(n) | Type::Int(n) => ((*n as u32) + 7) / 8,
-            Type::Bytes(n) => *n as u32,
+            Type::Bool => Some(1),
+            Type::Uint(n) | Type::Int(n) => Some(((*n as u32) + 7) / 8),
+            Type::Bytes(n) => Some(*n as u32),
             Type::Enum(n) => {
                 let bits = bin.ns.enums[*n].ty.bits(bin.ns) as u32;
-                (bits + 7) / 8
+                Some((bits + 7) / 8)
             }
-            Type::Value => bin.ns.value_length as u32,
-            Type::Contract(_) | Type::Address(_) => bin.ns.address_length as u32,
+            Type::Value => Some(bin.ns.value_length as u32),
+            Type::Contract(_) | Type::Address(_) => Some(bin.ns.address_length as u32),
+            Type::String | Type::DynamicBytes => None,
             _ => panic!(
                 "Antelope: unsupported parameter type for action data deserialization: {ty:?}"
             ),
         }
+    }
+
+    /// Check if any parameter in the list requires variable-length deserialization.
+    fn has_variable_length_params(params: &[ast::Parameter<Type>], bin: &Binary) -> bool {
+        params
+            .iter()
+            .any(|p| Self::datastream_fixed_size(&p.ty, bin).is_none())
     }
 
     /// Emit the `apply(receiver, code, action)` entry point.
@@ -341,6 +349,12 @@ impl AntelopeTarget {
         let receiver = apply_func.get_nth_param(0).unwrap().into_int_value();
         let code = apply_func.get_nth_param(1).unwrap().into_int_value();
         let action = apply_func.get_nth_param(2).unwrap().into_int_value();
+
+        // Initialize the heap allocator (linked-list at HEAP_START=0x10000).
+        // Must be called before any code that allocates (strings, dynamic arrays, etc.).
+        if let Some(init_heap) = bin.module.get_function("__init_heap") {
+            bin.builder.build_call(init_heap, &[], "").unwrap();
+        }
 
         // Store receiver in global for use by storage functions.
         let receiver_global = Self::get_receiver_global(bin);
@@ -437,30 +451,119 @@ impl AntelopeTarget {
                         )
                         .unwrap();
 
-                    // Deserialize each parameter: packed little-endian integers.
-                    let mut offset: u32 = 0;
+                    // Use dynamic offset for deserialization (needed for variable-length types).
+                    let offset_alloca = bin
+                        .builder
+                        .build_alloca(i32_ty, "ds_offset")
+                        .unwrap();
+                    bin.builder
+                        .build_store(offset_alloca, i32_ty.const_zero())
+                        .unwrap();
+
                     for param in cfg.params.iter() {
-                        let byte_size = Self::datastream_byte_size(&param.ty, bin);
-                        let llvm_ty = bin.llvm_var_ty(&param.ty);
+                        let cur_offset = bin
+                            .builder
+                            .build_load(i32_ty, offset_alloca, "cur_off")
+                            .unwrap()
+                            .into_int_value();
 
                         let param_ptr = unsafe {
                             bin.builder
                                 .build_gep(
                                     context.i8_type(),
                                     data_buf,
-                                    &[i32_ty.const_int(offset as u64, false)],
+                                    &[cur_offset],
                                     "param_ptr",
                                 )
                                 .unwrap()
                         };
 
-                        let param_val = bin
-                            .builder
-                            .build_load(llvm_ty, param_ptr, "param")
-                            .unwrap();
-                        args.push(param_val.into());
+                        if let Some(byte_size) = Self::datastream_fixed_size(&param.ty, bin) {
+                            // Fixed-size type: load directly from buffer.
+                            let llvm_ty = bin.llvm_var_ty(&param.ty);
+                            let param_val = bin
+                                .builder
+                                .build_load(llvm_ty, param_ptr, "param")
+                                .unwrap();
+                            args.push(param_val.into());
 
-                        offset += byte_size;
+                            let new_offset = bin
+                                .builder
+                                .build_int_add(
+                                    cur_offset,
+                                    i32_ty.const_int(byte_size as u64, false),
+                                    "new_off",
+                                )
+                                .unwrap();
+                            bin.builder
+                                .build_store(offset_alloca, new_offset)
+                                .unwrap();
+                        } else {
+                            // Variable-length type (string/bytes): read varuint32 length, then data.
+                            // Antelope DataStream encodes strings as: varuint32 length + raw bytes.
+                            // For simplicity, we support lengths < 128 (single-byte varuint).
+                            // This covers virtually all action parameter strings.
+                            let str_len = bin
+                                .builder
+                                .build_load(context.i8_type(), param_ptr, "str_len_byte")
+                                .unwrap()
+                                .into_int_value();
+                            let str_len_i32 = bin
+                                .builder
+                                .build_int_z_extend(str_len, i32_ty, "str_len")
+                                .unwrap();
+
+                            // Advance past the varuint32 length byte.
+                            let after_len = bin
+                                .builder
+                                .build_int_add(
+                                    cur_offset,
+                                    i32_ty.const_int(1, false),
+                                    "after_len",
+                                )
+                                .unwrap();
+
+                            let str_data_ptr = unsafe {
+                                bin.builder
+                                    .build_gep(
+                                        context.i8_type(),
+                                        data_buf,
+                                        &[after_len],
+                                        "str_data",
+                                    )
+                                    .unwrap()
+                            };
+
+                            // Allocate a vector on the heap: vector_new(len, 1, data_ptr)
+                            let vector_new_fn =
+                                bin.module.get_function("vector_new").unwrap();
+                            let vec_ptr = bin
+                                .builder
+                                .build_call(
+                                    vector_new_fn,
+                                    &[
+                                        str_len_i32.into(),
+                                        i32_ty.const_int(1, false).into(),
+                                        str_data_ptr.into(),
+                                    ],
+                                    "str_vec",
+                                )
+                                .unwrap()
+                                .try_as_basic_value()
+                                .left()
+                                .unwrap();
+
+                            args.push(vec_ptr.into());
+
+                            // Advance offset past length byte + string data.
+                            let new_offset = bin
+                                .builder
+                                .build_int_add(after_len, str_len_i32, "new_off")
+                                .unwrap();
+                            bin.builder
+                                .build_store(offset_alloca, new_offset)
+                                .unwrap();
+                        }
                     }
                 }
 

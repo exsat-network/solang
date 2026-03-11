@@ -1077,6 +1077,31 @@ pub fn expression(
         }
         ast::Expression::Builtin {
             loc,
+            kind: ast::Builtin::AntelopeName,
+            args,
+            ..
+        } => {
+            // Constant-fold antelope.name("string") → u64 at compile time.
+            // Extract the string literal from the argument.
+            // Solang may represent string literals as BytesLiteral or AllocDynamicBytes.
+            let name_str = match &args[0] {
+                ast::Expression::BytesLiteral { value, .. } => {
+                    String::from_utf8(value.clone()).unwrap_or_default()
+                }
+                ast::Expression::AllocDynamicBytes {
+                    init: Some(value), ..
+                } => String::from_utf8(value.clone()).unwrap_or_default(),
+                _ => String::new(),
+            };
+            let encoded = crate::emit::antelope::string_to_name(&name_str);
+            Expression::NumberLiteral {
+                loc: *loc,
+                ty: Type::Uint(64),
+                value: encoded.into(),
+            }
+        }
+        ast::Expression::Builtin {
+            loc,
             kind: ast::Builtin::AntelopeRequireAuth,
             args,
             ..
