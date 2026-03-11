@@ -151,11 +151,14 @@ impl AntelopeTarget {
             Some(Linkage::External),
         );
 
-        // void sha256(const char* data, uint32_t length, checksum256* hash)
-        let sha256_ty =
-            void_ty.fn_type(&[ptr_ty.into(), i32_ty.into(), ptr_ty.into()], false);
+        // void sha3(const char* data, uint32_t data_len, char* hash, uint32_t hash_len, int32_t keccak)
+        // keccak=1 for keccak256 mode (Ethereum-compatible)
+        let sha3_ty = void_ty.fn_type(
+            &[ptr_ty.into(), i32_ty.into(), ptr_ty.into(), i32_ty.into(), i32_ty.into()],
+            false,
+        );
         bin.module
-            .add_function("sha256", sha256_ty, Some(Linkage::External));
+            .add_function("sha3", sha3_ty, Some(Linkage::External));
 
         // int32_t db_end_i64(uint64_t code, uint64_t scope, uint64_t table)
         let db_end_ty = i32_ty.fn_type(

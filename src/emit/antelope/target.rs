@@ -837,10 +837,9 @@ impl<'a> TargetRuntime<'a> for AntelopeTarget {
         todo!("antelope: storage_array_length")
     }
 
-    /// Hash using Antelope's sha256 host function.
-    /// Used for mapping key slot derivation. Not actual keccak256 — this is fine
-    /// for internal storage slot computation (only needs to be deterministic and
-    /// collision-resistant). User-callable keccak256() would need a software impl.
+    /// Hash using Antelope's sha3 host function in keccak256 mode.
+    /// Matches Ethereum's keccak256 for storage slot derivation.
+    /// Requires CRYPTO_PRIMITIVES protocol feature (active on EOS mainnet).
     fn keccak256_hash(
         &self,
         bin: &Binary<'a>,
@@ -848,16 +847,23 @@ impl<'a> TargetRuntime<'a> for AntelopeTarget {
         length: IntValue,
         dest: PointerValue,
     ) {
-        let sha256_fn = bin.module.get_function("sha256").unwrap();
+        let sha3_fn = bin.module.get_function("sha3").unwrap();
+        let i32_ty = bin.context.i32_type();
         let len_i32 = if length.get_type().get_bit_width() == 32 {
             length
         } else {
             bin.builder
-                .build_int_truncate(length, bin.context.i32_type(), "len32")
+                .build_int_truncate(length, i32_ty, "len32")
                 .unwrap()
         };
+        let hash_len = i32_ty.const_int(32, false); // checksum256 = 32 bytes
+        let keccak_flag = i32_ty.const_int(1, false); // 1 = keccak256 mode
         bin.builder
-            .build_call(sha256_fn, &[src.into(), len_i32.into(), dest.into()], "")
+            .build_call(
+                sha3_fn,
+                &[src.into(), len_i32.into(), dest.into(), hash_len.into(), keccak_flag.into()],
+                "",
+            )
             .unwrap();
     }
 
