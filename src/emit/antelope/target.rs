@@ -453,6 +453,10 @@ impl<'a> TargetRuntime<'a> for AntelopeTarget {
         todo!("antelope: storage_array_length")
     }
 
+    /// Hash using Antelope's sha256 host function.
+    /// Used for mapping key slot derivation. Not actual keccak256 — this is fine
+    /// for internal storage slot computation (only needs to be deterministic and
+    /// collision-resistant). User-callable keccak256() would need a software impl.
     fn keccak256_hash(
         &self,
         bin: &Binary<'a>,
@@ -460,7 +464,17 @@ impl<'a> TargetRuntime<'a> for AntelopeTarget {
         length: IntValue,
         dest: PointerValue,
     ) {
-        todo!("antelope: keccak256_hash")
+        let sha256_fn = bin.module.get_function("sha256").unwrap();
+        let len_i32 = if length.get_type().get_bit_width() == 32 {
+            length
+        } else {
+            bin.builder
+                .build_int_truncate(length, bin.context.i32_type(), "len32")
+                .unwrap()
+        };
+        bin.builder
+            .build_call(sha256_fn, &[src.into(), len_i32.into(), dest.into()], "")
+            .unwrap();
     }
 
     /// Print a string by calling the Antelope `prints_l(msg, len)` host function.

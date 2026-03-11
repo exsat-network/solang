@@ -187,8 +187,8 @@ pub(super) fn assert_failure(
     cfg: &mut ControlFlowGraph,
     vartab: &mut Vartable,
 ) {
-    // On Solana, returning the encoded arguments has no effect
-    if ns.target == Target::Solana || ns.target == Target::Soroban {
+    // On Solana/Soroban/Antelope, returning the encoded arguments has no effect
+    if ns.target == Target::Solana || ns.target == Target::Soroban || ns.target == Target::Antelope {
         cfg.add(vartab, Instr::AssertFailure { encoded_args: None });
         return;
     }
@@ -296,7 +296,9 @@ pub(super) fn require(
                 .copied()
                 .collect::<Vec<u8>>();
 
-            let to_print = if ns.target == Target::Soroban {
+            let to_print = if ns.target == Target::Soroban || ns.target == Target::Antelope {
+                // Soroban/Antelope: use a static string to avoid heap allocation
+                // (FormatString requires vector_new → __malloc → heap)
                 Expression::BytesLiteral {
                     loc: Codegen,
                     ty: Type::String,

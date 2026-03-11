@@ -150,6 +150,12 @@ impl AntelopeTarget {
             read_action_data_ty,
             Some(Linkage::External),
         );
+
+        // void sha256(const char* data, uint32_t length, checksum256* hash)
+        let sha256_ty =
+            void_ty.fn_type(&[ptr_ty.into(), i32_ty.into(), ptr_ty.into()], false);
+        bin.module
+            .add_function("sha256", sha256_ty, Some(Linkage::External));
     }
 
     /// Add a WASM global to store the `receiver` account name (set in apply()).
