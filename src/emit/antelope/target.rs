@@ -366,6 +366,7 @@ impl<'a> TargetRuntime<'a> for AntelopeTarget {
             .build_load(i64_ty, receiver_global.as_pointer_value(), "receiver")
             .unwrap()
             .into_int_value();
+        let ram_payer = AntelopeTarget::get_ram_payer(bin);
 
         let table_name = i64_ty.const_int(STATE_TABLE_NAME, false);
 
@@ -541,7 +542,7 @@ impl<'a> TargetRuntime<'a> for AntelopeTarget {
                 db_update,
                 &[
                     pri_iter.into(),
-                    receiver.into(),
+                    ram_payer.into(),
                     row_buf.into(),
                     row_size_const.into(),
                 ],
@@ -683,7 +684,7 @@ impl<'a> TargetRuntime<'a> for AntelopeTarget {
                 &[
                     receiver.into(),
                     table_name.into(),
-                    receiver.into(),
+                    ram_payer.into(),
                     new_pk_val.into(),
                     row_buf.into(),
                     row_size_const.into(),
@@ -700,7 +701,7 @@ impl<'a> TargetRuntime<'a> for AntelopeTarget {
                 &[
                     receiver.into(),
                     table_name.into(),
-                    receiver.into(),
+                    ram_payer.into(),
                     new_pk_val.into(),
                     slot_buf.into(),
                     data_len.into(),
@@ -1155,6 +1156,280 @@ impl<'a> TargetRuntime<'a> for AntelopeTarget {
                     .build_load(i64_ty, receiver_global.as_pointer_value(), "self_recv")
                     .unwrap()
             }
+            Expression::Builtin {
+                kind: Builtin::AntelopeCode,
+                ..
+            } => {
+                let i64_ty = bin.context.i64_type();
+                let code_global = bin.module.get_global("__code").unwrap();
+                bin.builder
+                    .build_load(i64_ty, code_global.as_pointer_value(), "code_acct")
+                    .unwrap()
+            }
+            Expression::Builtin {
+                kind: Builtin::AntelopeRequireRecipient,
+                args,
+                ..
+            } => {
+                let account = crate::emit::expression::expression(
+                    &AntelopeTarget,
+                    bin,
+                    &args[0],
+                    vartab,
+                    function,
+                )
+                .into_int_value();
+
+                let require_recipient_fn =
+                    bin.module.get_function("require_recipient").unwrap();
+                bin.builder
+                    .build_call(require_recipient_fn, &[account.into()], "")
+                    .unwrap();
+
+                bin.context.i64_type().const_zero().into()
+            }
+            Expression::Builtin {
+                kind: Builtin::AntelopeCall,
+                args,
+                ..
+            } => {
+                // antelope.call(contract, action_name, packed_data)
+                // Serializes an Antelope action struct and calls send_inline.
+                //
+                // Antelope serialized action format:
+                //   account:     uint64   (8 bytes)  — target contract
+                //   action_name: uint64   (8 bytes)  — action name
+                //   auth_count:  varuint32(1 byte)   — number of permission entries (we use 1)
+                //   auth[0].actor:      uint64 (8 bytes) — self (current contract)
+                //   auth[0].permission: uint64 (8 bytes) — eosio::name("active") = 0x3232EDA800000000
+                //   data_len:    varuint32(1 byte)   — length of packed action data
+                //   data:        bytes                — raw packed action data
+                //
+                // Total header = 8 + 8 + 1 + 8 + 8 + 1 = 34 bytes, then data.
+
+                let i32_ty = bin.context.i32_type();
+                let i64_ty = bin.context.i64_type();
+                let i8_ty = bin.context.i8_type();
+
+                let contract_account = crate::emit::expression::expression(
+                    &AntelopeTarget,
+                    bin,
+                    &args[0],
+                    vartab,
+                    function,
+                )
+                .into_int_value();
+
+                let action_name = crate::emit::expression::expression(
+                    &AntelopeTarget,
+                    bin,
+                    &args[1],
+                    vartab,
+                    function,
+                )
+                .into_int_value();
+
+                // The third argument is a bytes vector (pointer to vector struct).
+                let data_vec = crate::emit::expression::expression(
+                    &AntelopeTarget,
+                    bin,
+                    &args[2],
+                    vartab,
+                    function,
+                );
+
+                // Get data length and data pointer from the vector.
+                // Vector layout: [length: u32, ...data]
+                let data_len = bin.vector_len(data_vec);
+
+                let data_ptr = bin.vector_bytes(data_vec);
+
+                // Load receiver (self) for the authorization.
+                let receiver_global = AntelopeTarget::get_receiver_global(bin);
+                let self_account = bin
+                    .builder
+                    .build_load(i64_ty, receiver_global.as_pointer_value(), "self_acct")
+                    .unwrap()
+                    .into_int_value();
+
+                let active_perm = i64_ty.const_int(crate::emit::antelope::string_to_name("active"), false);
+
+                // Encode data_len as varuint32 to know its byte size.
+                let encode_fn = bin.module.get_function("__encode_varuint32").unwrap();
+                let vi_tmp = bin
+                    .builder
+                    .build_array_alloca(i8_ty, i32_ty.const_int(5, false), "vi_tmp")
+                    .unwrap();
+                let data_vi_size = bin
+                    .builder
+                    .build_call(encode_fn, &[vi_tmp.into(), data_len.into()], "dvi_sz")
+                    .unwrap()
+                    .try_as_basic_value()
+                    .left()
+                    .unwrap()
+                    .into_int_value();
+
+                // Serialized action layout:
+                //   account(8) + action_name(8) + auth_count(1=varuint for 1)
+                //   + actor(8) + permission(8) + data_len(varuint) + data(N)
+                // Fixed part = 8+8+1+8+8 = 33, then data_vi_size + data_len
+                let fixed_part = i32_ty.const_int(33, false);
+                let total_size = bin.builder.build_int_add(fixed_part, data_vi_size, "ts1").unwrap();
+                let total_size = bin.builder.build_int_add(total_size, data_len, "total_size").unwrap();
+
+                let malloc_fn = bin.module.get_function("__malloc").unwrap();
+                let buf = bin
+                    .builder
+                    .build_call(malloc_fn, &[total_size.into()], "action_buf")
+                    .unwrap()
+                    .try_as_basic_value()
+                    .left()
+                    .unwrap()
+                    .into_pointer_value();
+
+                // Write account (offset 0)
+                bin.builder.build_store(buf, contract_account).unwrap();
+
+                // Write action_name (offset 8)
+                let off8 = unsafe {
+                    bin.builder.build_gep(i8_ty, buf, &[i32_ty.const_int(8, false)], "off8").unwrap()
+                };
+                bin.builder.build_store(off8, action_name).unwrap();
+
+                // Write auth_count = 1 (offset 16, varuint32 for value 1 = single byte 0x01)
+                let off16 = unsafe {
+                    bin.builder.build_gep(i8_ty, buf, &[i32_ty.const_int(16, false)], "off16").unwrap()
+                };
+                bin.builder
+                    .build_store(off16, i8_ty.const_int(1, false))
+                    .unwrap();
+
+                // Write auth[0].actor = self (offset 17)
+                let off17 = unsafe {
+                    bin.builder.build_gep(i8_ty, buf, &[i32_ty.const_int(17, false)], "off17").unwrap()
+                };
+                bin.builder.build_store(off17, self_account).unwrap();
+
+                // Write auth[0].permission = active (offset 25)
+                let off25 = unsafe {
+                    bin.builder.build_gep(i8_ty, buf, &[i32_ty.const_int(25, false)], "off25").unwrap()
+                };
+                bin.builder.build_store(off25, active_perm).unwrap();
+
+                // Write data_len as varuint32 (offset 33)
+                let off33 = unsafe {
+                    bin.builder.build_gep(i8_ty, buf, &[fixed_part], "off33").unwrap()
+                };
+                bin.builder
+                    .build_call(encode_fn, &[off33.into(), data_len.into()], "")
+                    .unwrap();
+
+                // Copy data after varuint32
+                let data_offset = bin.builder.build_int_add(fixed_part, data_vi_size, "doff").unwrap();
+                let data_dst = unsafe {
+                    bin.builder.build_gep(i8_ty, buf, &[data_offset], "ddst").unwrap()
+                };
+                bin.builder
+                    .build_memcpy(data_dst, 1, data_ptr, 1, data_len)
+                    .unwrap();
+
+                // Call send_inline(buf, total_size)
+                let send_inline_fn = bin.module.get_function("send_inline").unwrap();
+                bin.builder
+                    .build_call(send_inline_fn, &[buf.into(), total_size.into()], "")
+                    .unwrap();
+
+                bin.context.i64_type().const_zero().into()
+            }
+            Expression::Builtin {
+                kind: Builtin::AntelopeCallAuth,
+                args,
+                ..
+            } => {
+                // antelope.callauth(contract, action_name, data, actor, permission)
+                let i32_ty = bin.context.i32_type();
+                let i64_ty = bin.context.i64_type();
+                let i8_ty = bin.context.i8_type();
+
+                let contract_account = crate::emit::expression::expression(
+                    &AntelopeTarget, bin, &args[0], vartab, function,
+                ).into_int_value();
+                let action_name = crate::emit::expression::expression(
+                    &AntelopeTarget, bin, &args[1], vartab, function,
+                ).into_int_value();
+                let data_vec = crate::emit::expression::expression(
+                    &AntelopeTarget, bin, &args[2], vartab, function,
+                );
+                let actor = crate::emit::expression::expression(
+                    &AntelopeTarget, bin, &args[3], vartab, function,
+                ).into_int_value();
+                let permission = crate::emit::expression::expression(
+                    &AntelopeTarget, bin, &args[4], vartab, function,
+                ).into_int_value();
+
+                let data_len = bin.vector_len(data_vec);
+                let data_ptr = bin.vector_bytes(data_vec);
+
+                let encode_fn = bin.module.get_function("__encode_varuint32").unwrap();
+                let vi_tmp = bin.builder
+                    .build_array_alloca(i8_ty, i32_ty.const_int(5, false), "vi_tmp")
+                    .unwrap();
+                let data_vi_size = bin.builder
+                    .build_call(encode_fn, &[vi_tmp.into(), data_len.into()], "dvi_sz")
+                    .unwrap().try_as_basic_value().left().unwrap().into_int_value();
+
+                let fixed_part = i32_ty.const_int(33, false);
+                let total_size = bin.builder.build_int_add(fixed_part, data_vi_size, "ts1").unwrap();
+                let total_size = bin.builder.build_int_add(total_size, data_len, "total_size").unwrap();
+
+                let malloc_fn = bin.module.get_function("__malloc").unwrap();
+                let buf = bin.builder
+                    .build_call(malloc_fn, &[total_size.into()], "action_buf")
+                    .unwrap().try_as_basic_value().left().unwrap().into_pointer_value();
+
+                // account (offset 0)
+                bin.builder.build_store(buf, contract_account).unwrap();
+                // action_name (offset 8)
+                let off8 = unsafe { bin.builder.build_gep(i8_ty, buf, &[i32_ty.const_int(8, false)], "off8").unwrap() };
+                bin.builder.build_store(off8, action_name).unwrap();
+                // auth_count = 1 (offset 16)
+                let off16 = unsafe { bin.builder.build_gep(i8_ty, buf, &[i32_ty.const_int(16, false)], "off16").unwrap() };
+                bin.builder.build_store(off16, i8_ty.const_int(1, false)).unwrap();
+                // auth[0].actor (offset 17)
+                let off17 = unsafe { bin.builder.build_gep(i8_ty, buf, &[i32_ty.const_int(17, false)], "off17").unwrap() };
+                bin.builder.build_store(off17, actor).unwrap();
+                // auth[0].permission (offset 25)
+                let off25 = unsafe { bin.builder.build_gep(i8_ty, buf, &[i32_ty.const_int(25, false)], "off25").unwrap() };
+                bin.builder.build_store(off25, permission).unwrap();
+                // data_len varuint32 (offset 33)
+                let off33 = unsafe { bin.builder.build_gep(i8_ty, buf, &[fixed_part], "off33").unwrap() };
+                bin.builder.build_call(encode_fn, &[off33.into(), data_len.into()], "").unwrap();
+                // data bytes
+                let data_offset = bin.builder.build_int_add(fixed_part, data_vi_size, "doff").unwrap();
+                let data_dst = unsafe { bin.builder.build_gep(i8_ty, buf, &[data_offset], "ddst").unwrap() };
+                bin.builder.build_memcpy(data_dst, 1, data_ptr, 1, data_len).unwrap();
+
+                let send_inline_fn = bin.module.get_function("send_inline").unwrap();
+                bin.builder.build_call(send_inline_fn, &[buf.into(), total_size.into()], "").unwrap();
+
+                bin.context.i64_type().const_zero().into()
+            }
+            Expression::Builtin {
+                kind: Builtin::AntelopeSetPayer,
+                args,
+                ..
+            } => {
+                let payer = crate::emit::expression::expression(
+                    &AntelopeTarget, bin, &args[0], vartab, function,
+                ).into_int_value();
+
+                let payer_global = bin.module.get_global("__ram_payer").unwrap();
+                bin.builder
+                    .build_store(payer_global.as_pointer_value(), payer)
+                    .unwrap();
+
+                bin.context.i64_type().const_zero().into()
+            }
             _ => panic!("antelope: unimplemented builtin expression: {expr:?}"),
         }
     }
@@ -1189,7 +1464,119 @@ impl<'a> TargetRuntime<'a> for AntelopeTarget {
         data: BasicValueEnum<'b>,
         topics: &[BasicValueEnum<'b>],
     ) {
-        todo!("antelope: emit_event")
+        // Antelope events are emitted as inline actions to self via send_inline.
+        //
+        // topics[0] = eosio::name(event_name) as uint64 (compile-time constant)
+        // data = ABI-encoded event fields (vector of bytes)
+        //
+        // Serialized action layout:
+        //   account(8) + action_name(8) + auth_count(1) + actor(8) + perm(8)
+        //   + data_len(varuint32) + data(N)
+
+        let i32_ty = bin.context.i32_type();
+        let i64_ty = bin.context.i64_type();
+        let i8_ty = bin.context.i8_type();
+
+        // topics[0] is the event name as eosio::name uint64.
+        let event_name = if !topics.is_empty() {
+            topics[0].into_int_value()
+        } else {
+            i64_ty.const_zero()
+        };
+
+        // Get data length and pointer from the ABI-encoded vector.
+        let data_len = bin.vector_len(data);
+        let data_ptr = bin.vector_bytes(data);
+
+        // Load self account.
+        let receiver_global = AntelopeTarget::get_receiver_global(bin);
+        let self_account = bin
+            .builder
+            .build_load(i64_ty, receiver_global.as_pointer_value(), "self_acct")
+            .unwrap()
+            .into_int_value();
+
+        let active_perm = i64_ty.const_int(crate::emit::antelope::string_to_name("active"), false);
+
+        // Encode data_len as varuint32 to know its byte size.
+        let encode_fn = bin.module.get_function("__encode_varuint32").unwrap();
+        let vi_tmp = bin
+            .builder
+            .build_array_alloca(i8_ty, i32_ty.const_int(5, false), "vi_tmp")
+            .unwrap();
+        let data_vi_size = bin
+            .builder
+            .build_call(encode_fn, &[vi_tmp.into(), data_len.into()], "dvi_sz")
+            .unwrap()
+            .try_as_basic_value()
+            .left()
+            .unwrap()
+            .into_int_value();
+
+        // Total = 33 (fixed) + varuint_size + data_len
+        let fixed_part = i32_ty.const_int(33, false);
+        let total_size = bin.builder.build_int_add(fixed_part, data_vi_size, "ts1").unwrap();
+        let total_size = bin.builder.build_int_add(total_size, data_len, "total_size").unwrap();
+
+        let malloc_fn = bin.module.get_function("__malloc").unwrap();
+        let buf = bin
+            .builder
+            .build_call(malloc_fn, &[total_size.into()], "evt_buf")
+            .unwrap()
+            .try_as_basic_value()
+            .left()
+            .unwrap()
+            .into_pointer_value();
+
+        // account = self (offset 0)
+        bin.builder.build_store(buf, self_account).unwrap();
+
+        // action_name = event name (offset 8)
+        let off8 = unsafe {
+            bin.builder.build_gep(i8_ty, buf, &[i32_ty.const_int(8, false)], "off8").unwrap()
+        };
+        bin.builder.build_store(off8, event_name).unwrap();
+
+        // auth_count = 1 (offset 16)
+        let off16 = unsafe {
+            bin.builder.build_gep(i8_ty, buf, &[i32_ty.const_int(16, false)], "off16").unwrap()
+        };
+        bin.builder.build_store(off16, i8_ty.const_int(1, false)).unwrap();
+
+        // auth[0].actor = self (offset 17)
+        let off17 = unsafe {
+            bin.builder.build_gep(i8_ty, buf, &[i32_ty.const_int(17, false)], "off17").unwrap()
+        };
+        bin.builder.build_store(off17, self_account).unwrap();
+
+        // auth[0].permission = active (offset 25)
+        let off25 = unsafe {
+            bin.builder.build_gep(i8_ty, buf, &[i32_ty.const_int(25, false)], "off25").unwrap()
+        };
+        bin.builder.build_store(off25, active_perm).unwrap();
+
+        // data_len as varuint32 (offset 33)
+        let off33 = unsafe {
+            bin.builder.build_gep(i8_ty, buf, &[fixed_part], "off33").unwrap()
+        };
+        bin.builder
+            .build_call(encode_fn, &[off33.into(), data_len.into()], "")
+            .unwrap();
+
+        // data bytes (offset 33 + varuint_size)
+        let data_offset = bin.builder.build_int_add(fixed_part, data_vi_size, "doff").unwrap();
+        let data_dst = unsafe {
+            bin.builder.build_gep(i8_ty, buf, &[data_offset], "ddst").unwrap()
+        };
+        bin.builder
+            .build_memcpy(data_dst, 1, data_ptr, 1, data_len)
+            .unwrap();
+
+        // send_inline(buf, total_size)
+        let send_inline_fn = bin.module.get_function("send_inline").unwrap();
+        bin.builder
+            .build_call(send_inline_fn, &[buf.into(), total_size.into()], "")
+            .unwrap();
     }
 
     fn return_abi_data<'b>(
@@ -1228,6 +1615,7 @@ impl AntelopeTarget {
             .build_load(i64_ty, receiver_global.as_pointer_value(), "receiver")
             .unwrap()
             .into_int_value();
+        let ram_payer = Self::get_ram_payer(bin);
         let table_name = i64_ty.const_int(STATE_TABLE_NAME, false);
 
         // Convert slot to 256-bit.
@@ -1244,13 +1632,25 @@ impl AntelopeTarget {
             .unwrap();
         bin.builder.build_store(slot_buf, slot_i256).unwrap();
 
-        // Row size = 8 (pk) + 32 (hash) + 1 (varuint32 len) + string_len.
-        // Note: varuint32 is 1 byte for lengths < 128. Strings > 127 bytes not yet supported.
-        let header_size = i32_ty.const_int(41, false); // pk(8) + hash(32) + varuint(1)
-        let row_size = bin
+        // Encode string_len as varuint32 into a temp buffer to know how many bytes it takes.
+        let encode_fn = bin.module.get_function("__encode_varuint32").unwrap();
+        let varuint_tmp = bin
             .builder
-            .build_int_add(header_size, string_len, "row_size")
+            .build_array_alloca(bin.context.i8_type(), i32_ty.const_int(5, false), "vi_tmp")
             .unwrap();
+        let varuint_size = bin
+            .builder
+            .build_call(encode_fn, &[varuint_tmp.into(), string_len.into()], "vi_sz")
+            .unwrap()
+            .try_as_basic_value()
+            .left()
+            .unwrap()
+            .into_int_value();
+
+        // Row size = 8 (pk) + 32 (hash) + varuint_size + string_len.
+        let fixed_header = i32_ty.const_int(40, false); // pk(8) + hash(32)
+        let row_size = bin.builder.build_int_add(fixed_header, varuint_size, "rs1").unwrap();
+        let row_size = bin.builder.build_int_add(row_size, string_len, "row_size").unwrap();
 
         // Allocate row buffer via malloc (dynamic size, can't use stack alloca).
         let malloc = bin.module.get_function("__malloc").unwrap();
@@ -1271,22 +1671,21 @@ impl AntelopeTarget {
         };
         bin.builder.build_store(hash_ptr, slot_i256).unwrap();
 
-        // Write varuint32 length byte at offset 40.
-        let len_ptr = unsafe {
+        // Write varuint32(string_len) at offset 40 using __encode_varuint32.
+        let varuint_ptr = unsafe {
             bin.builder
-                .build_gep(bin.context.i8_type(), row_buf, &[i32_ty.const_int(40, false)], "len_ptr")
+                .build_gep(bin.context.i8_type(), row_buf, &[fixed_header], "vi_ptr")
                 .unwrap()
         };
-        let len_byte = bin
-            .builder
-            .build_int_truncate(string_len, bin.context.i8_type(), "len_byte")
+        bin.builder
+            .build_call(encode_fn, &[varuint_ptr.into(), string_len.into()], "")
             .unwrap();
-        bin.builder.build_store(len_ptr, len_byte).unwrap();
 
-        // Copy string bytes at offset 41.
+        // Copy string bytes after the varuint32.
+        let data_offset = bin.builder.build_int_add(fixed_header, varuint_size, "doff").unwrap();
         let val_ptr = unsafe {
             bin.builder
-                .build_gep(bin.context.i8_type(), row_buf, &[header_size], "val_ptr")
+                .build_gep(bin.context.i8_type(), row_buf, &[data_offset], "val_ptr")
                 .unwrap()
         };
         let memcpy = bin.module.get_function("__memcpy").unwrap();
@@ -1339,7 +1738,7 @@ impl AntelopeTarget {
             .into_int_value();
         let db_update = bin.module.get_function("db_update_i64").unwrap();
         bin.builder
-            .build_call(db_update, &[pri_iter.into(), receiver.into(), row_buf.into(), row_size.into()], "")
+            .build_call(db_update, &[pri_iter.into(), ram_payer.into(), row_buf.into(), row_size.into()], "")
             .unwrap();
         bin.builder.build_unconditional_branch(done_bb).unwrap();
 
@@ -1425,7 +1824,7 @@ impl AntelopeTarget {
         bin.builder
             .build_call(
                 db_store,
-                &[receiver.into(), table_name.into(), receiver.into(), new_pk_val.into(), row_buf.into(), row_size.into()],
+                &[receiver.into(), table_name.into(), ram_payer.into(), new_pk_val.into(), row_buf.into(), row_size.into()],
                 "",
             )
             .unwrap();
@@ -1434,7 +1833,7 @@ impl AntelopeTarget {
         bin.builder
             .build_call(
                 db_idx256_store,
-                &[receiver.into(), table_name.into(), receiver.into(), new_pk_val.into(), slot_buf.into(), data_len.into()],
+                &[receiver.into(), table_name.into(), ram_payer.into(), new_pk_val.into(), slot_buf.into(), data_len.into()],
                 "",
             )
             .unwrap();
@@ -1535,15 +1934,7 @@ impl AntelopeTarget {
             .unwrap()
             .into_int_value();
 
-        // String length = row_total_size - 41 (pk:8 + hash:32 + varuint32_len:1).
-        let header_size = i32_ty.const_int(41, false);
-        let str_len = bin
-            .builder
-            .build_int_sub(row_total_size, header_size, "str_len")
-            .unwrap();
-
         // Allocate row buffer via malloc (dynamic size).
-        let malloc = bin.module.get_function("__malloc").unwrap();
         let row_buf = bin
             .builder
             .build_call(malloc, &[row_total_size.into()], "row_buf")
@@ -1567,10 +1958,44 @@ impl AntelopeTarget {
             .build_call(db_get, &[pri_iter2.into(), row_buf.into(), row_total_size.into()], "")
             .unwrap();
 
-        // String data starts at offset 41 (after pk:8 + hash:32 + varuint32:1).
+        // Decode varuint32 at offset 40 to get string length and varuint byte count.
+        let fixed_header = i32_ty.const_int(40, false); // pk(8) + hash(32)
+        let varuint_ptr = unsafe {
+            bin.builder
+                .build_gep(bin.context.i8_type(), row_buf, &[fixed_header], "vi_ptr")
+                .unwrap()
+        };
+        let decode_fn = bin.module.get_function("__decode_varuint32").unwrap();
+        let packed = bin
+            .builder
+            .build_call(decode_fn, &[varuint_ptr.into()], "packed")
+            .unwrap()
+            .try_as_basic_value()
+            .left()
+            .unwrap()
+            .into_int_value();
+
+        // Unpack: low 32 bits = string length, high 32 bits = varuint byte count
+        let str_len = bin
+            .builder
+            .build_int_truncate(packed, i32_ty, "str_len")
+            .unwrap();
+        let varuint_size = bin
+            .builder
+            .build_int_truncate(
+                bin.builder
+                    .build_right_shift(packed, bin.context.i64_type().const_int(32, false), false, "hi")
+                    .unwrap(),
+                i32_ty,
+                "vi_sz",
+            )
+            .unwrap();
+
+        // String data starts at offset 40 + varuint_size.
+        let data_offset = bin.builder.build_int_add(fixed_header, varuint_size, "doff").unwrap();
         let str_ptr = unsafe {
             bin.builder
-                .build_gep(bin.context.i8_type(), row_buf, &[header_size], "str_ptr")
+                .build_gep(bin.context.i8_type(), row_buf, &[data_offset], "str_ptr")
                 .unwrap()
         };
 

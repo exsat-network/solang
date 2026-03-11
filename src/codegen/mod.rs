@@ -1870,7 +1870,12 @@ pub enum Builtin {
     AccessMapping,
     AntelopeRequireAuth,
     AntelopeSelf,
+    AntelopeCode,
     AntelopeName,
+    AntelopeRequireRecipient,
+    AntelopeCall,
+    AntelopeCallAuth,
+    AntelopeSetPayer,
 }
 
 impl From<&ast::Builtin> for Builtin {
@@ -1939,7 +1944,12 @@ impl From<&ast::Builtin> for Builtin {
             ast::Builtin::ExtendInstanceTtl => Builtin::ExtendInstanceTtl,
             ast::Builtin::AntelopeRequireAuth => Builtin::AntelopeRequireAuth,
             ast::Builtin::AntelopeSelf => Builtin::AntelopeSelf,
+            ast::Builtin::AntelopeCode => Builtin::AntelopeCode,
             ast::Builtin::AntelopeName => Builtin::AntelopeName,
+            ast::Builtin::AntelopeRequireRecipient => Builtin::AntelopeRequireRecipient,
+            ast::Builtin::AntelopeCall => Builtin::AntelopeCall,
+            ast::Builtin::AntelopeCallAuth => Builtin::AntelopeCallAuth,
+            ast::Builtin::AntelopeSetPayer => Builtin::AntelopeSetPayer,
             _ => panic!("Builtin should not be in the cfg"),
         }
     }

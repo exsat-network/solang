@@ -36,7 +36,7 @@ pub struct Prototype {
 }
 
 // A list of all Solidity builtins functions
-pub static BUILTIN_FUNCTIONS: Lazy<[Prototype; 32]> = Lazy::new(|| { // 29 original + 3 Antelope
+pub static BUILTIN_FUNCTIONS: Lazy<[Prototype; 37]> = Lazy::new(|| { // 29 original + 8 Antelope
     [
         Prototype {
             builtin: Builtin::ExtendInstanceTtl,
@@ -392,6 +392,17 @@ pub static BUILTIN_FUNCTIONS: Lazy<[Prototype; 32]> = Lazy::new(|| { // 29 origi
             constant: false,
         },
         Prototype {
+            builtin: Builtin::AntelopeCode,
+            namespace: Some("antelope"),
+            method: vec![],
+            name: "code",
+            params: vec![],
+            ret: vec![Type::Uint(64)],
+            target: vec![Target::Antelope],
+            doc: "Returns the code account of the current action. Equals receiver() on direct calls; differs on notifications (require_recipient).",
+            constant: false,
+        },
+        Prototype {
             builtin: Builtin::AntelopeName,
             namespace: Some("antelope"),
             method: vec![],
@@ -401,6 +412,50 @@ pub static BUILTIN_FUNCTIONS: Lazy<[Prototype; 32]> = Lazy::new(|| { // 29 origi
             target: vec![Target::Antelope],
             doc: "Encode a string literal as an Antelope eosio::name uint64 at compile time.",
             constant: true,
+        },
+        Prototype {
+            builtin: Builtin::AntelopeRequireRecipient,
+            namespace: Some("antelope"),
+            method: vec![],
+            name: "requireRecipient",
+            params: vec![Type::Uint(64)],
+            ret: vec![],
+            target: vec![Target::Antelope],
+            doc: "Send a notification to the given account. The account's contract will receive the current action.",
+            constant: false,
+        },
+        Prototype {
+            builtin: Builtin::AntelopeCall,
+            namespace: Some("antelope"),
+            method: vec![],
+            name: "call",
+            params: vec![Type::Uint(64), Type::Uint(64), Type::DynamicBytes],
+            ret: vec![],
+            target: vec![Target::Antelope],
+            doc: "Send an inline action to another contract with self@active auth. Args: contract (uint64), action_name (uint64), packed_data (bytes).",
+            constant: false,
+        },
+        Prototype {
+            builtin: Builtin::AntelopeCallAuth,
+            namespace: Some("antelope"),
+            method: vec![],
+            name: "callauth",
+            params: vec![Type::Uint(64), Type::Uint(64), Type::DynamicBytes, Type::Uint(64), Type::Uint(64)],
+            ret: vec![],
+            target: vec![Target::Antelope],
+            doc: "Send an inline action with explicit auth. Args: contract, action_name, data, actor, permission.",
+            constant: false,
+        },
+        Prototype {
+            builtin: Builtin::AntelopeSetPayer,
+            namespace: Some("antelope"),
+            method: vec![],
+            name: "setpayer",
+            params: vec![Type::Uint(64)],
+            ret: vec![],
+            target: vec![Target::Antelope],
+            doc: "Set the RAM payer for subsequent storage operations. Defaults to self if not called.",
+            constant: false,
         },
     ]
 });

@@ -1842,7 +1842,12 @@ pub enum Builtin {
     ExtendInstanceTtl,
     AntelopeRequireAuth,
     AntelopeSelf,
+    AntelopeCode,
     AntelopeName,
+    AntelopeRequireRecipient,
+    AntelopeCall,
+    AntelopeCallAuth,
+    AntelopeSetPayer,
 }
 
 #[derive(PartialEq, Eq, Clone, Debug)]

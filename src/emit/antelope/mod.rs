@@ -9,7 +9,7 @@ use crate::sema::ast;
 use crate::sema::ast::Type;
 use inkwell::context::Context;
 use inkwell::module::{Linkage, Module};
-use inkwell::values::{BasicMetadataValueEnum, GlobalValue};
+use inkwell::values::{BasicMetadataValueEnum, GlobalValue, IntValue};
 use inkwell::AddressSpace;
 use inkwell::IntPredicate;
 
@@ -73,6 +73,7 @@ impl AntelopeTarget {
 
         Self::declare_externals(&mut bin);
         Self::add_receiver_global(&mut bin);
+        Self::emit_varuint32_helpers(context, &mut bin);
         Self::emit_functions(contract, &mut bin);
         Self::emit_apply(context, &mut bin, contract, &mut export_list);
 
@@ -245,6 +246,19 @@ impl AntelopeTarget {
             current_receiver_ty,
             Some(Linkage::External),
         );
+
+        // void require_recipient(uint64_t name)
+        let require_recipient_ty = void_ty.fn_type(&[i64_ty.into()], false);
+        bin.module.add_function(
+            "require_recipient",
+            require_recipient_ty,
+            Some(Linkage::External),
+        );
+
+        // void send_inline(const char* serialized_action, uint32_t size)
+        let send_inline_ty = void_ty.fn_type(&[ptr_ty.into(), i32_ty.into()], false);
+        bin.module
+            .add_function("send_inline", send_inline_ty, Some(Linkage::External));
     }
 
     /// Add WASM globals for receiver and auto-increment pk cache.
@@ -262,6 +276,18 @@ impl AntelopeTarget {
         let pk_global = bin.module.add_global(i64_ty, None, "__next_pk");
         pk_global.set_initializer(&i64_ty.const_all_ones()); // UINT64_MAX sentinel
         pk_global.set_linkage(Linkage::Internal);
+
+        // __ram_payer: RAM payer for storage operations.
+        // 0 = use receiver (default). Set via antelope.setpayer(account).
+        let payer_global = bin.module.add_global(i64_ty, None, "__ram_payer");
+        payer_global.set_initializer(&i64_ty.const_zero());
+        payer_global.set_linkage(Linkage::Internal);
+
+        // __code: the account that sent this action (set in apply()).
+        // Equals receiver on direct calls; differs on notifications (require_recipient).
+        let code_global = bin.module.add_global(i64_ty, None, "__code");
+        code_global.set_initializer(&i64_ty.const_zero());
+        code_global.set_linkage(Linkage::Internal);
     }
 
     /// Get the __receiver global value.
@@ -272,6 +298,281 @@ impl AntelopeTarget {
     /// Get the __next_pk global value.
     pub fn get_next_pk_global<'a>(bin: &Binary<'a>) -> GlobalValue<'a> {
         bin.module.get_global("__next_pk").unwrap()
+    }
+
+    /// Get the RAM payer: if __ram_payer != 0, use it; otherwise use receiver.
+    pub fn get_ram_payer<'a>(bin: &Binary<'a>) -> IntValue<'a> {
+        let i64_ty = bin.context.i64_type();
+        let payer_global = bin.module.get_global("__ram_payer").unwrap();
+        let payer = bin
+            .builder
+            .build_load(i64_ty, payer_global.as_pointer_value(), "payer")
+            .unwrap()
+            .into_int_value();
+
+        let receiver_global = bin.module.get_global("__receiver").unwrap();
+        let receiver = bin
+            .builder
+            .build_load(i64_ty, receiver_global.as_pointer_value(), "recv")
+            .unwrap()
+            .into_int_value();
+
+        // if payer != 0 { payer } else { receiver }
+        let is_set = bin
+            .builder
+            .build_int_compare(inkwell::IntPredicate::NE, payer, i64_ty.const_zero(), "pset")
+            .unwrap();
+        bin.builder
+            .build_select(is_set, payer, receiver, "ram_payer")
+            .unwrap()
+            .into_int_value()
+    }
+
+    /// Emit helper functions for varuint32 encoding/decoding.
+    ///
+    /// __encode_varuint32(buf: *mut u8, value: u32) -> u32 (bytes written)
+    /// __decode_varuint32(buf: *const u8) -> u64 (low 32 bits = value, high 32 bits = bytes read)
+    fn emit_varuint32_helpers<'a>(context: &'a Context, bin: &mut Binary<'a>) {
+        let i8_ty = context.i8_type();
+        let i32_ty = context.i32_type();
+        let i64_ty = context.i64_type();
+        let ptr_ty = context.ptr_type(inkwell::AddressSpace::default());
+
+        // --- __encode_varuint32(buf, value) -> bytes_written ---
+        {
+            let fn_ty = i32_ty.fn_type(&[ptr_ty.into(), i32_ty.into()], false);
+            let func = bin
+                .module
+                .add_function("__encode_varuint32", fn_ty, Some(Linkage::Internal));
+
+            let entry = context.append_basic_block(func, "entry");
+            let loop_bb = context.append_basic_block(func, "loop");
+            let done_bb = context.append_basic_block(func, "done");
+
+            bin.builder.position_at_end(entry);
+            let buf = func.get_nth_param(0).unwrap().into_pointer_value();
+            let value = func.get_nth_param(1).unwrap().into_int_value();
+
+            // offset = 0, remaining = value
+            let offset_alloca = bin.builder.build_alloca(i32_ty, "offset").unwrap();
+            let remain_alloca = bin.builder.build_alloca(i32_ty, "remain").unwrap();
+            bin.builder
+                .build_store(offset_alloca, i32_ty.const_zero())
+                .unwrap();
+            bin.builder.build_store(remain_alloca, value).unwrap();
+            bin.builder.build_unconditional_branch(loop_bb).unwrap();
+
+            // Loop: write one byte at a time
+            bin.builder.position_at_end(loop_bb);
+            let remain = bin
+                .builder
+                .build_load(i32_ty, remain_alloca, "rem")
+                .unwrap()
+                .into_int_value();
+            let offset = bin
+                .builder
+                .build_load(i32_ty, offset_alloca, "off")
+                .unwrap()
+                .into_int_value();
+
+            // byte = remain & 0x7F
+            let byte_val = bin
+                .builder
+                .build_and(remain, i32_ty.const_int(0x7F, false), "byte")
+                .unwrap();
+            // remain >>= 7
+            let new_remain = bin
+                .builder
+                .build_right_shift(remain, i32_ty.const_int(7, false), false, "shr")
+                .unwrap();
+
+            // if new_remain > 0: set high bit
+            let has_more = bin
+                .builder
+                .build_int_compare(IntPredicate::UGT, new_remain, i32_ty.const_zero(), "more")
+                .unwrap();
+            let high_bit = bin
+                .builder
+                .build_select(has_more, i32_ty.const_int(0x80, false), i32_ty.const_zero(), "hb")
+                .unwrap()
+                .into_int_value();
+            let final_byte = bin.builder.build_or(byte_val, high_bit, "fb").unwrap();
+
+            // buf[offset] = final_byte
+            let byte_ptr = unsafe {
+                bin.builder
+                    .build_gep(i8_ty, buf, &[offset], "bp")
+                    .unwrap()
+            };
+            let byte_i8 = bin
+                .builder
+                .build_int_truncate(final_byte, i8_ty, "b8")
+                .unwrap();
+            bin.builder.build_store(byte_ptr, byte_i8).unwrap();
+
+            // offset++
+            let new_offset = bin
+                .builder
+                .build_int_add(offset, i32_ty.const_int(1, false), "no")
+                .unwrap();
+            bin.builder
+                .build_store(offset_alloca, new_offset)
+                .unwrap();
+            bin.builder
+                .build_store(remain_alloca, new_remain)
+                .unwrap();
+
+            bin.builder
+                .build_conditional_branch(has_more, loop_bb, done_bb)
+                .unwrap();
+
+            bin.builder.position_at_end(done_bb);
+            let final_offset = bin
+                .builder
+                .build_load(i32_ty, offset_alloca, "final_off")
+                .unwrap();
+            bin.builder.build_return(Some(&final_offset)).unwrap();
+        }
+
+        // --- __decode_varuint32(buf) -> u64 (low32=value, high32=bytes_read) ---
+        {
+            let fn_ty = i64_ty.fn_type(&[ptr_ty.into()], false);
+            let func = bin
+                .module
+                .add_function("__decode_varuint32", fn_ty, Some(Linkage::Internal));
+
+            let entry = context.append_basic_block(func, "entry");
+            let loop_bb = context.append_basic_block(func, "loop");
+            let done_bb = context.append_basic_block(func, "done");
+
+            bin.builder.position_at_end(entry);
+            let buf = func.get_nth_param(0).unwrap().into_pointer_value();
+
+            let result_alloca = bin.builder.build_alloca(i32_ty, "result").unwrap();
+            let shift_alloca = bin.builder.build_alloca(i32_ty, "shift").unwrap();
+            let offset_alloca = bin.builder.build_alloca(i32_ty, "offset").unwrap();
+
+            bin.builder
+                .build_store(result_alloca, i32_ty.const_zero())
+                .unwrap();
+            bin.builder
+                .build_store(shift_alloca, i32_ty.const_zero())
+                .unwrap();
+            bin.builder
+                .build_store(offset_alloca, i32_ty.const_zero())
+                .unwrap();
+            bin.builder.build_unconditional_branch(loop_bb).unwrap();
+
+            bin.builder.position_at_end(loop_bb);
+            let offset = bin
+                .builder
+                .build_load(i32_ty, offset_alloca, "off")
+                .unwrap()
+                .into_int_value();
+            let shift = bin
+                .builder
+                .build_load(i32_ty, shift_alloca, "sh")
+                .unwrap()
+                .into_int_value();
+            let result = bin
+                .builder
+                .build_load(i32_ty, result_alloca, "res")
+                .unwrap()
+                .into_int_value();
+
+            // byte = buf[offset]
+            let byte_ptr = unsafe {
+                bin.builder
+                    .build_gep(i8_ty, buf, &[offset], "bp")
+                    .unwrap()
+            };
+            let byte_val = bin
+                .builder
+                .build_load(i8_ty, byte_ptr, "bv")
+                .unwrap()
+                .into_int_value();
+            let byte_i32 = bin
+                .builder
+                .build_int_z_extend(byte_val, i32_ty, "b32")
+                .unwrap();
+
+            // result |= (byte & 0x7F) << shift
+            let masked = bin
+                .builder
+                .build_and(byte_i32, i32_ty.const_int(0x7F, false), "m")
+                .unwrap();
+            let shifted = bin.builder.build_left_shift(masked, shift, "sl").unwrap();
+            let new_result = bin.builder.build_or(result, shifted, "nr").unwrap();
+            bin.builder
+                .build_store(result_alloca, new_result)
+                .unwrap();
+
+            // shift += 7
+            let new_shift = bin
+                .builder
+                .build_int_add(shift, i32_ty.const_int(7, false), "ns")
+                .unwrap();
+            bin.builder
+                .build_store(shift_alloca, new_shift)
+                .unwrap();
+
+            // offset++
+            let new_offset = bin
+                .builder
+                .build_int_add(offset, i32_ty.const_int(1, false), "no")
+                .unwrap();
+            bin.builder
+                .build_store(offset_alloca, new_offset)
+                .unwrap();
+
+            // if byte & 0x80: continue
+            let has_more = bin
+                .builder
+                .build_int_compare(
+                    IntPredicate::NE,
+                    bin.builder
+                        .build_and(byte_i32, i32_ty.const_int(0x80, false), "hb")
+                        .unwrap(),
+                    i32_ty.const_zero(),
+                    "more",
+                )
+                .unwrap();
+            bin.builder
+                .build_conditional_branch(has_more, loop_bb, done_bb)
+                .unwrap();
+
+            // Done: pack (value, bytes_read) into i64
+            bin.builder.position_at_end(done_bb);
+            let final_result = bin
+                .builder
+                .build_load(i32_ty, result_alloca, "fv")
+                .unwrap()
+                .into_int_value();
+            let final_offset = bin
+                .builder
+                .build_load(i32_ty, offset_alloca, "fo")
+                .unwrap()
+                .into_int_value();
+
+            // packed = (bytes_read << 32) | value
+            let result_i64 = bin
+                .builder
+                .build_int_z_extend(final_result, i64_ty, "r64")
+                .unwrap();
+            let offset_i64 = bin
+                .builder
+                .build_int_z_extend(final_offset, i64_ty, "o64")
+                .unwrap();
+            let shifted_offset = bin
+                .builder
+                .build_left_shift(offset_i64, i64_ty.const_int(32, false), "so")
+                .unwrap();
+            let packed = bin
+                .builder
+                .build_or(result_i64, shifted_offset, "packed")
+                .unwrap();
+            bin.builder.build_return(Some(&packed)).unwrap();
+        }
     }
 
     fn emit_functions<'a>(contract: &'a ast::Contract, bin: &mut Binary<'a>) {
@@ -359,23 +660,25 @@ impl AntelopeTarget {
             bin.builder.build_call(init_heap, &[], "").unwrap();
         }
 
-        // Store receiver in global for use by storage functions.
+        // Store receiver and code in globals for use by builtins.
         let receiver_global = Self::get_receiver_global(bin);
         bin.builder
             .build_store(receiver_global.as_pointer_value(), receiver)
             .unwrap();
-
-        // Only dispatch if code == receiver (i.e., action is directed at this contract).
-        let code_eq_receiver = bin
-            .builder
-            .build_int_compare(IntPredicate::EQ, code, receiver, "code_eq_recv")
+        let code_global = bin.module.get_global("__code").unwrap();
+        bin.builder
+            .build_store(code_global.as_pointer_value(), code)
             .unwrap();
 
+        // Dispatch actions regardless of code == receiver.
+        // When code == receiver: normal action call.
+        // When code != receiver: notification (from require_recipient).
+        // Both paths dispatch to the same action handlers.
         let dispatch_bb = context.append_basic_block(apply_func, "dispatch");
         let return_bb = context.append_basic_block(apply_func, "return");
 
         bin.builder
-            .build_conditional_branch(code_eq_receiver, dispatch_bb, return_bb)
+            .build_unconditional_branch(dispatch_bb)
             .unwrap();
 
         bin.builder.position_at_end(dispatch_bb);
