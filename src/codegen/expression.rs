@@ -1077,6 +1077,29 @@ pub fn expression(
         }
         ast::Expression::Builtin {
             loc,
+            kind: ast::Builtin::AntelopeRequireAuth,
+            args,
+            ..
+        } => {
+            let arg = expression(&args[0], cfg, contract_no, func, ns, vartab, opt);
+            let res = vartab.temp_anonymous(&Type::Uint(64));
+            cfg.add(
+                vartab,
+                Instr::Set {
+                    loc: *loc,
+                    res,
+                    expr: Expression::Builtin {
+                        loc: *loc,
+                        tys: vec![Type::Uint(64)],
+                        kind: Builtin::AntelopeRequireAuth,
+                        args: vec![arg],
+                    },
+                },
+            );
+            Expression::Poison
+        }
+        ast::Expression::Builtin {
+            loc,
             tys,
             kind,
             args,

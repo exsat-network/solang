@@ -36,7 +36,7 @@ pub struct Prototype {
 }
 
 // A list of all Solidity builtins functions
-pub static BUILTIN_FUNCTIONS: Lazy<[Prototype; 29]> = Lazy::new(|| {
+pub static BUILTIN_FUNCTIONS: Lazy<[Prototype; 31]> = Lazy::new(|| { // 29 original + 2 Antelope
     [
         Prototype {
             builtin: Builtin::ExtendInstanceTtl,
@@ -367,6 +367,28 @@ pub static BUILTIN_FUNCTIONS: Lazy<[Prototype; 29]> = Lazy::new(|| {
             ret: vec![],
             target: vec![Target::Soroban],
             doc: "Authorizes sub-contract calls for the next contract call on behalf of the current contract.",
+            constant: false,
+        },
+        Prototype {
+            builtin: Builtin::AntelopeRequireAuth,
+            namespace: Some("antelope"),
+            method: vec![],
+            name: "requireAuth",
+            params: vec![Type::Uint(64)],
+            ret: vec![],
+            target: vec![Target::Antelope],
+            doc: "Require authorization from the given Antelope account. Aborts if not authorized.",
+            constant: false,
+        },
+        Prototype {
+            builtin: Builtin::AntelopeSelf,
+            namespace: Some("antelope"),
+            method: vec![],
+            name: "self",
+            params: vec![],
+            ret: vec![Type::Uint(64)],
+            target: vec![Target::Antelope],
+            doc: "Returns the current contract's Antelope account name as uint64.",
             constant: false,
         },
     ]

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::codegen::cfg::HashTy;
-use crate::codegen::Expression;
+use crate::codegen::{Builtin, Expression};
 use crate::emit::antelope::{AntelopeTarget, STATE_TABLE_NAME};
 use crate::emit::binary::Binary;
 use crate::emit::ContractArgs;
@@ -592,6 +592,11 @@ impl<'a> TargetRuntime<'a> for AntelopeTarget {
         bin.builder.position_at_end(done_bb);
     }
 
+    /// Delete a value from Antelope table storage via idx256 secondary index.
+    ///
+    /// 1. Find via idx256: db_idx256_find_secondary(slot_hash) → sec_iter, pk
+    /// 2. If found: db_find_i64(pk) → pri_iter, then db_remove_i64(pri_iter) + db_idx256_remove(sec_iter)
+    /// 3. If not found: no-op (deleting non-existent slot is fine)
     fn storage_delete(
         &self,
         bin: &Binary<'a>,
@@ -599,7 +604,131 @@ impl<'a> TargetRuntime<'a> for AntelopeTarget {
         slot: &mut IntValue<'a>,
         function: FunctionValue<'a>,
     ) {
-        todo!("antelope: storage_delete")
+        let i32_ty = bin.context.i32_type();
+        let i64_ty = bin.context.i64_type();
+        let i256_ty = bin.context.custom_width_int_type(256);
+
+        // Load receiver.
+        let receiver_global = AntelopeTarget::get_receiver_global(bin);
+        let receiver = bin
+            .builder
+            .build_load(i64_ty, receiver_global.as_pointer_value(), "receiver")
+            .unwrap()
+            .into_int_value();
+
+        let table_name = i64_ty.const_int(STATE_TABLE_NAME, false);
+
+        // Convert slot to 256-bit value and store to stack buffer.
+        let slot_i256 = if slot.get_type().get_bit_width() == 256 {
+            *slot
+        } else if slot.get_type().get_bit_width() > 256 {
+            bin.builder
+                .build_int_truncate(*slot, i256_ty, "slot256")
+                .unwrap()
+        } else {
+            bin.builder
+                .build_int_z_extend(*slot, i256_ty, "slot256")
+                .unwrap()
+        };
+
+        let slot_buf = bin
+            .builder
+            .build_array_alloca(
+                bin.context.i8_type(),
+                i32_ty.const_int(32, false),
+                "slot_buf",
+            )
+            .unwrap();
+        bin.builder.build_store(slot_buf, slot_i256).unwrap();
+
+        // Look up via idx256.
+        let pk_out = bin.builder.build_alloca(i64_ty, "pk_out").unwrap();
+        let db_idx256_find = bin
+            .module
+            .get_function("db_idx256_find_secondary")
+            .unwrap();
+        let data_len = i32_ty.const_int(2, false);
+        let sec_iter = bin
+            .builder
+            .build_call(
+                db_idx256_find,
+                &[
+                    receiver.into(),
+                    receiver.into(),
+                    table_name.into(),
+                    slot_buf.into(),
+                    data_len.into(),
+                    pk_out.into(),
+                ],
+                "sec_iter",
+            )
+            .unwrap()
+            .try_as_basic_value()
+            .left()
+            .unwrap()
+            .into_int_value();
+
+        let found = bin
+            .builder
+            .build_int_compare(
+                IntPredicate::SGE,
+                sec_iter,
+                i32_ty.const_zero(),
+                "found",
+            )
+            .unwrap();
+
+        let delete_bb = bin.context.append_basic_block(function, "del_found");
+        let done_bb = bin.context.append_basic_block(function, "del_done");
+
+        bin.builder
+            .build_conditional_branch(found, delete_bb, done_bb)
+            .unwrap();
+
+        // FOUND: remove both primary row and secondary index entry.
+        bin.builder.position_at_end(delete_bb);
+
+        let pk = bin
+            .builder
+            .build_load(i64_ty, pk_out, "pk")
+            .unwrap()
+            .into_int_value();
+
+        // Find primary row iterator.
+        let db_find = bin.module.get_function("db_find_i64").unwrap();
+        let pri_iter = bin
+            .builder
+            .build_call(
+                db_find,
+                &[
+                    receiver.into(),
+                    receiver.into(),
+                    table_name.into(),
+                    pk.into(),
+                ],
+                "pri_iter",
+            )
+            .unwrap()
+            .try_as_basic_value()
+            .left()
+            .unwrap()
+            .into_int_value();
+
+        // db_remove_i64(pri_iter)
+        let db_remove = bin.module.get_function("db_remove_i64").unwrap();
+        bin.builder
+            .build_call(db_remove, &[pri_iter.into()], "")
+            .unwrap();
+
+        // db_idx256_remove(sec_iter)
+        let db_idx256_remove = bin.module.get_function("db_idx256_remove").unwrap();
+        bin.builder
+            .build_call(db_idx256_remove, &[sec_iter.into()], "")
+            .unwrap();
+
+        bin.builder.build_unconditional_branch(done_bb).unwrap();
+
+        bin.builder.position_at_end(done_bb);
     }
 
     fn set_storage_string(
@@ -823,7 +952,44 @@ impl<'a> TargetRuntime<'a> for AntelopeTarget {
         vartab: &HashMap<usize, Variable<'b>>,
         function: FunctionValue<'b>,
     ) -> BasicValueEnum<'b> {
-        todo!("antelope: builtin expressions")
+        match expr {
+            Expression::Builtin {
+                kind: Builtin::AntelopeRequireAuth,
+                args,
+                ..
+            } => {
+                let account = crate::emit::expression::expression(
+                    &AntelopeTarget,
+                    bin,
+                    &args[0],
+                    vartab,
+                    function,
+                )
+                .into_int_value();
+
+                let require_auth_fn = bin.module.get_function("require_auth").unwrap();
+                bin.builder
+                    .build_call(require_auth_fn, &[account.into()], "")
+                    .unwrap();
+
+                // requireAuth returns void; return a dummy value.
+                bin.context
+                    .i64_type()
+                    .const_zero()
+                    .into()
+            }
+            Expression::Builtin {
+                kind: Builtin::AntelopeSelf,
+                ..
+            } => {
+                let i64_ty = bin.context.i64_type();
+                let receiver_global = AntelopeTarget::get_receiver_global(bin);
+                bin.builder
+                    .build_load(i64_ty, receiver_global.as_pointer_value(), "self_recv")
+                    .unwrap()
+            }
+            _ => panic!("antelope: unimplemented builtin expression: {expr:?}"),
+        }
     }
 
     fn return_data<'b>(&self, bin: &Binary<'b>, function: FunctionValue<'b>) -> PointerValue<'b> {

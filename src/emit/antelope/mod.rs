@@ -216,6 +216,32 @@ impl AntelopeTarget {
             db_idx256_update_ty,
             Some(Linkage::External),
         );
+
+        // void db_remove_i64(int32_t iterator)
+        let db_remove_ty = void_ty.fn_type(&[i32_ty.into()], false);
+        bin.module
+            .add_function("db_remove_i64", db_remove_ty, Some(Linkage::External));
+
+        // void db_idx256_remove(int32_t iterator)
+        let db_idx256_remove_ty = void_ty.fn_type(&[i32_ty.into()], false);
+        bin.module.add_function(
+            "db_idx256_remove",
+            db_idx256_remove_ty,
+            Some(Linkage::External),
+        );
+
+        // void require_auth(uint64_t name)
+        let require_auth_ty = void_ty.fn_type(&[i64_ty.into()], false);
+        bin.module
+            .add_function("require_auth", require_auth_ty, Some(Linkage::External));
+
+        // uint64_t current_receiver()
+        let current_receiver_ty = i64_ty.fn_type(&[], false);
+        bin.module.add_function(
+            "current_receiver",
+            current_receiver_ty,
+            Some(Linkage::External),
+        );
     }
 
     /// Add WASM globals for receiver and auto-increment pk cache.

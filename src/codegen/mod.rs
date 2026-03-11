@@ -1868,6 +1868,8 @@ pub enum Builtin {
     ExtendTtl,
     ExtendInstanceTtl,
     AccessMapping,
+    AntelopeRequireAuth,
+    AntelopeSelf,
 }
 
 impl From<&ast::Builtin> for Builtin {
@@ -1934,6 +1936,8 @@ impl From<&ast::Builtin> for Builtin {
             ast::Builtin::AuthAsCurrContract => Builtin::AuthAsCurrContract,
             ast::Builtin::ExtendTtl => Builtin::ExtendTtl,
             ast::Builtin::ExtendInstanceTtl => Builtin::ExtendInstanceTtl,
+            ast::Builtin::AntelopeRequireAuth => Builtin::AntelopeRequireAuth,
+            ast::Builtin::AntelopeSelf => Builtin::AntelopeSelf,
             _ => panic!("Builtin should not be in the cfg"),
         }
     }

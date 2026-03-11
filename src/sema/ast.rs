@@ -1840,6 +1840,8 @@ pub enum Builtin {
     AuthAsCurrContract,
     ExtendTtl,
     ExtendInstanceTtl,
+    AntelopeRequireAuth,
+    AntelopeSelf,
 }
 
 #[derive(PartialEq, Eq, Clone, Debug)]
