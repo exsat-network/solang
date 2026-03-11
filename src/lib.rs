@@ -33,6 +33,8 @@ pub enum Target {
     /// Ethereum EVM, see <https://ethereum.org/en/developers/docs/evm/>
     EVM,
     Soroban,
+    /// Antelope (EOS, WAX, Telos, etc.), see <https://antelope.io/>
+    Antelope,
 }
 
 impl fmt::Display for Target {
@@ -42,6 +44,7 @@ impl fmt::Display for Target {
             Target::Polkadot { .. } => write!(f, "Polkadot"),
             Target::EVM => write!(f, "EVM"),
             Target::Soroban => write!(f, "Soroban"),
+            Target::Antelope => write!(f, "Antelope"),
         }
     }
 }
@@ -55,6 +58,7 @@ impl PartialEq for Target {
             Target::Polkadot { .. } => matches!(other, Target::Polkadot { .. }),
             Target::EVM => matches!(other, Target::EVM),
             Target::Soroban => matches!(other, Target::Soroban),
+            Target::Antelope => matches!(other, Target::Antelope),
         }
     }
 }
@@ -79,6 +83,7 @@ impl Target {
             "solana" => Some(Target::Solana),
             "polkadot" => Some(Target::default_polkadot()),
             "evm" => Some(Target::EVM),
+            "antelope" => Some(Target::Antelope),
             _ => None,
         }
     }

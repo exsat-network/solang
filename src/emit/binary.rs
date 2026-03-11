@@ -17,7 +17,7 @@ use tempfile::tempdir;
 use wasm_opt::OptimizationOptions;
 
 use crate::codegen::{cfg::ReturnCode, Options};
-use crate::emit::{polkadot, TargetRuntime};
+use crate::emit::{antelope, polkadot, TargetRuntime};
 use crate::emit::{solana, BinaryOp, Generate};
 use crate::linker::link;
 use crate::Target;
@@ -190,6 +190,9 @@ impl<'a> Binary<'a> {
             #[cfg(feature = "soroban")]
             Target::Soroban => {
                 soroban::SorobanTarget::build(context, &std_lib, contract, ns, opt, _contract_no)
+            }
+            Target::Antelope => {
+                antelope::AntelopeTarget::build(context, &std_lib, contract, ns, opt)
             }
             _ => unimplemented!("target not implemented"),
         }

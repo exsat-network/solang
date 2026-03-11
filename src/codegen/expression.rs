@@ -3820,7 +3820,7 @@ fn array_subscript(
         let index = expression(index, cfg, contract_no, func, ns, vartab, opt);
 
         return match ns.target {
-            Target::Solana | Target::Soroban | Target::EVM => Expression::Subscript {
+            Target::Solana | Target::Soroban | Target::EVM | Target::Antelope => Expression::Subscript {
                 loc: *loc,
                 ty: elem_ty.clone(),
                 array_ty: array_ty.clone(),

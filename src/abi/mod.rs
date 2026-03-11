@@ -4,6 +4,7 @@ use crate::sema::ast::Namespace;
 use crate::Target;
 
 pub mod anchor;
+pub mod antelope;
 pub mod ethereum;
 pub mod polkadot;
 mod tests;
@@ -40,6 +41,18 @@ pub fn generate_abi(
             let idl = anchor::generate_anchor_idl(contract_no, ns, version);
 
             (serde_json::to_string_pretty(&idl).unwrap(), "json")
+        }
+        Target::Antelope => {
+            if verbose {
+                eprintln!(
+                    "info: Generating Antelope ABI for contract {}",
+                    ns.contracts[contract_no].id
+                );
+            }
+
+            let abi = antelope::gen_abi(contract_no, ns);
+
+            (serde_json::to_string_pretty(&abi).unwrap(), "abi")
         }
         _ => {
             if verbose {
