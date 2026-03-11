@@ -18,6 +18,8 @@ use inkwell::IntPredicate;
 
 use solang_parser::pt::{Loc, StorageType};
 
+use num_bigint::BigInt;
+use num_traits::{ToPrimitive, Zero};
 use std::collections::HashMap;
 
 // Antelope TargetRuntime implementation.
@@ -52,6 +54,50 @@ impl<'a> TargetRuntime<'a> for AntelopeTarget {
         function: FunctionValue<'a>,
         storage_type: &Option<StorageType>,
     ) -> BasicValueEnum<'a> {
+        // Struct: load each field recursively at consecutive slots.
+        if let Type::Struct(struct_type) = ty {
+            let struct_def = struct_type.definition(bin.ns);
+            let llvm_ty = bin.llvm_type(ty);
+            let struct_ptr = bin.build_alloca(function, llvm_ty, "struct_alloc");
+
+            let mut current_slot = *slot;
+            for (i, field) in struct_def.fields.iter().enumerate() {
+                if field.infinite_size {
+                    continue;
+                }
+                let field_val =
+                    self.storage_load(bin, &field.ty, &mut current_slot, function, storage_type);
+                let field_ptr = bin
+                    .builder
+                    .build_struct_gep(llvm_ty.into_struct_type(), struct_ptr, i as u32, "field_ptr")
+                    .unwrap();
+                bin.builder.build_store(field_ptr, field_val).unwrap();
+                // Advance slot by number of storage slots this field occupies.
+                let slots = field.ty.storage_slots(bin.ns);
+                if !slots.is_zero() {
+                    let slot_inc = bin
+                        .context
+                        .custom_width_int_type(256)
+                        .const_int(slots.to_u64().unwrap_or(1), false);
+                    current_slot = bin
+                        .builder
+                        .build_int_add(current_slot, slot_inc, "next_slot")
+                        .unwrap();
+                }
+            }
+            return bin
+                .builder
+                .build_load(llvm_ty, struct_ptr, "struct_loaded")
+                .unwrap();
+        }
+
+        // String/DynamicBytes: variable-length row.
+        if matches!(ty, Type::String | Type::DynamicBytes) {
+            return self
+                .storage_load_string(bin, slot, function)
+                .into();
+        }
+
         let i32_ty = bin.context.i32_type();
         let i64_ty = bin.context.i64_type();
         let i256_ty = bin.context.custom_width_int_type(256);
@@ -247,6 +293,65 @@ impl<'a> TargetRuntime<'a> for AntelopeTarget {
         function: FunctionValue<'a>,
         storage_type: &Option<StorageType>,
     ) {
+        // Struct: store each field recursively at consecutive slots.
+        if let Type::Struct(struct_type) = ty {
+            let struct_def = struct_type.definition(bin.ns);
+            let llvm_ty = bin.llvm_type(ty);
+
+            // dest may be a pointer to the struct (heap-allocated) or a struct value.
+            let struct_ptr = if dest.is_pointer_value() {
+                // Already a pointer — use it directly.
+                dest.into_pointer_value()
+            } else {
+                // Struct value — store to temp alloca so we can GEP fields.
+                let tmp = bin.build_alloca(function, llvm_ty, "struct_tmp");
+                bin.builder.build_store(tmp, dest).unwrap();
+                tmp
+            };
+
+            let mut current_slot = *slot;
+            for (i, field) in struct_def.fields.iter().enumerate() {
+                if field.infinite_size {
+                    continue;
+                }
+                let field_ptr = bin
+                    .builder
+                    .build_struct_gep(llvm_ty.into_struct_type(), struct_ptr, i as u32, "field_ptr")
+                    .unwrap();
+                let field_val = bin
+                    .builder
+                    .build_load(bin.llvm_type(&field.ty), field_ptr, "field_val")
+                    .unwrap();
+                self.storage_store(
+                    bin,
+                    &field.ty,
+                    existing,
+                    &mut current_slot,
+                    field_val,
+                    function,
+                    storage_type,
+                );
+                let slots = field.ty.storage_slots(bin.ns);
+                if !slots.is_zero() {
+                    let slot_inc = bin
+                        .context
+                        .custom_width_int_type(256)
+                        .const_int(slots.to_u64().unwrap_or(1), false);
+                    current_slot = bin
+                        .builder
+                        .build_int_add(current_slot, slot_inc, "next_slot")
+                        .unwrap();
+                }
+            }
+            return;
+        }
+
+        // String/DynamicBytes: variable-length row.
+        if matches!(ty, Type::String | Type::DynamicBytes) {
+            self.storage_store_string(bin, slot, dest, function);
+            return;
+        }
+
         let i32_ty = bin.context.i32_type();
         let i64_ty = bin.context.i64_type();
         let i256_ty = bin.context.custom_width_int_type(256);
@@ -604,6 +709,30 @@ impl<'a> TargetRuntime<'a> for AntelopeTarget {
         slot: &mut IntValue<'a>,
         function: FunctionValue<'a>,
     ) {
+        // Struct: delete each field recursively at consecutive slots.
+        if let Type::Struct(struct_type) = ty {
+            let struct_def = struct_type.definition(bin.ns);
+            let mut current_slot = *slot;
+            for field in &struct_def.fields {
+                if field.infinite_size {
+                    continue;
+                }
+                self.storage_delete(bin, &field.ty, &mut current_slot, function);
+                let slots = field.ty.storage_slots(bin.ns);
+                if !slots.is_zero() {
+                    let slot_inc = bin
+                        .context
+                        .custom_width_int_type(256)
+                        .const_int(slots.to_u64().unwrap_or(1), false);
+                    current_slot = bin
+                        .builder
+                        .build_int_add(current_slot, slot_inc, "next_slot")
+                        .unwrap();
+                }
+            }
+            return;
+        }
+
         let i32_ty = bin.context.i32_type();
         let i64_ty = bin.context.i64_type();
         let i256_ty = bin.context.custom_width_int_type(256);
@@ -738,7 +867,15 @@ impl<'a> TargetRuntime<'a> for AntelopeTarget {
         slot: PointerValue<'a>,
         dest: BasicValueEnum<'a>,
     ) {
-        todo!("antelope: set_storage_string")
+        // Load the slot as i256 from the pointer.
+        let i256_ty = bin.context.custom_width_int_type(256);
+        let slot_val = bin
+            .builder
+            .build_load(i256_ty, slot, "slot_val")
+            .unwrap()
+            .into_int_value();
+        let mut slot_mut = slot_val;
+        self.storage_store_string(bin, &mut slot_mut, dest.into(), function);
     }
 
     fn get_storage_string(
@@ -747,7 +884,14 @@ impl<'a> TargetRuntime<'a> for AntelopeTarget {
         function: FunctionValue,
         slot: PointerValue<'a>,
     ) -> PointerValue<'a> {
-        todo!("antelope: get_storage_string")
+        let i256_ty = bin.context.custom_width_int_type(256);
+        let slot_val = bin
+            .builder
+            .build_load(i256_ty, slot, "slot_val")
+            .unwrap()
+            .into_int_value();
+        let mut slot_mut = slot_val;
+        self.storage_load_string(bin, &mut slot_mut, function)
     }
 
     fn set_storage_extfunc(
@@ -1038,5 +1182,404 @@ impl<'a> TargetRuntime<'a> for AntelopeTarget {
         data_len: BasicValueEnum<'b>,
     ) {
         // Antelope actions don't return ABI data; no-op.
+    }
+}
+
+/// Helper methods for Antelope string/variable-length storage.
+impl AntelopeTarget {
+    /// Store a string (Solang vector) to the state table.
+    /// Row format: [pk(8) + slot_hash(32) + string_bytes(N)].
+    fn storage_store_string<'a>(
+        &self,
+        bin: &Binary<'a>,
+        slot: &mut IntValue<'a>,
+        dest: BasicValueEnum<'a>,
+        function: FunctionValue,
+    ) {
+        let i32_ty = bin.context.i32_type();
+        let i64_ty = bin.context.i64_type();
+        let i256_ty = bin.context.custom_width_int_type(256);
+
+        // Get string data pointer and length from Solang vector.
+        let string_len = bin.vector_len(dest);
+        let string_data = bin.vector_bytes(dest);
+
+        // Load receiver.
+        let receiver_global = Self::get_receiver_global(bin);
+        let receiver = bin
+            .builder
+            .build_load(i64_ty, receiver_global.as_pointer_value(), "receiver")
+            .unwrap()
+            .into_int_value();
+        let table_name = i64_ty.const_int(STATE_TABLE_NAME, false);
+
+        // Convert slot to 256-bit.
+        let slot_i256 = if slot.get_type().get_bit_width() == 256 {
+            *slot
+        } else {
+            bin.builder
+                .build_int_z_extend(*slot, i256_ty, "slot256")
+                .unwrap()
+        };
+        let slot_buf = bin
+            .builder
+            .build_array_alloca(bin.context.i8_type(), i32_ty.const_int(32, false), "slot_buf")
+            .unwrap();
+        bin.builder.build_store(slot_buf, slot_i256).unwrap();
+
+        // Row size = 8 (pk) + 32 (hash) + string_len.
+        let header_size = i32_ty.const_int(40, false);
+        let row_size = bin
+            .builder
+            .build_int_add(header_size, string_len, "row_size")
+            .unwrap();
+
+        // Allocate row buffer via malloc (dynamic size, can't use stack alloca).
+        let malloc = bin.module.get_function("__malloc").unwrap();
+        let row_buf = bin
+            .builder
+            .build_call(malloc, &[row_size.into()], "row_buf")
+            .unwrap()
+            .try_as_basic_value()
+            .left()
+            .unwrap()
+            .into_pointer_value();
+
+        // Write slot_hash at offset 8.
+        let hash_ptr = unsafe {
+            bin.builder
+                .build_gep(bin.context.i8_type(), row_buf, &[i32_ty.const_int(8, false)], "hash_ptr")
+                .unwrap()
+        };
+        bin.builder.build_store(hash_ptr, slot_i256).unwrap();
+
+        // Copy string bytes at offset 40.
+        let val_ptr = unsafe {
+            bin.builder
+                .build_gep(bin.context.i8_type(), row_buf, &[header_size], "val_ptr")
+                .unwrap()
+        };
+        let memcpy = bin.module.get_function("__memcpy").unwrap();
+        bin.builder
+            .build_call(memcpy, &[val_ptr.into(), string_data.into(), string_len.into()], "")
+            .unwrap();
+
+        let data_len = i32_ty.const_int(2, false); // idx256 data_len
+
+        // Look up existing row via idx256.
+        let pk_out = bin.builder.build_alloca(i64_ty, "pk_out").unwrap();
+        let db_idx256_find = bin.module.get_function("db_idx256_find_secondary").unwrap();
+        let sec_iter = bin
+            .builder
+            .build_call(
+                db_idx256_find,
+                &[receiver.into(), receiver.into(), table_name.into(), slot_buf.into(), data_len.into(), pk_out.into()],
+                "sec_iter",
+            )
+            .unwrap()
+            .try_as_basic_value()
+            .left()
+            .unwrap()
+            .into_int_value();
+
+        let found = bin
+            .builder
+            .build_int_compare(IntPredicate::SGE, sec_iter, i32_ty.const_zero(), "found")
+            .unwrap();
+
+        let update_bb = bin.context.append_basic_block(function, "str_update");
+        let insert_bb = bin.context.append_basic_block(function, "str_insert");
+        let done_bb = bin.context.append_basic_block(function, "str_done");
+
+        bin.builder.build_conditional_branch(found, update_bb, insert_bb).unwrap();
+
+        // UPDATE: write pk, find primary, update row.
+        bin.builder.position_at_end(update_bb);
+        let pk = bin.builder.build_load(i64_ty, pk_out, "pk").unwrap().into_int_value();
+        bin.builder.build_store(row_buf, pk).unwrap();
+
+        let db_find = bin.module.get_function("db_find_i64").unwrap();
+        let pri_iter = bin
+            .builder
+            .build_call(db_find, &[receiver.into(), receiver.into(), table_name.into(), pk.into()], "pri_iter")
+            .unwrap()
+            .try_as_basic_value()
+            .left()
+            .unwrap()
+            .into_int_value();
+        let db_update = bin.module.get_function("db_update_i64").unwrap();
+        bin.builder
+            .build_call(db_update, &[pri_iter.into(), receiver.into(), row_buf.into(), row_size.into()], "")
+            .unwrap();
+        bin.builder.build_unconditional_branch(done_bb).unwrap();
+
+        // INSERT: allocate new pk, store row + idx256.
+        bin.builder.position_at_end(insert_bb);
+        let pk_global = Self::get_next_pk_global(bin);
+        let cached_pk = bin
+            .builder
+            .build_load(i64_ty, pk_global.as_pointer_value(), "cached_pk")
+            .unwrap()
+            .into_int_value();
+
+        let sentinel = i64_ty.const_all_ones();
+        let need_init = bin
+            .builder
+            .build_int_compare(IntPredicate::EQ, cached_pk, sentinel, "need_init")
+            .unwrap();
+
+        let init_bb = bin.context.append_basic_block(function, "str_pk_init");
+        let use_cached_bb = bin.context.append_basic_block(function, "str_pk_cached");
+        let do_insert_bb = bin.context.append_basic_block(function, "str_do_insert");
+
+        bin.builder.build_conditional_branch(need_init, init_bb, use_cached_bb).unwrap();
+
+        // INIT pk from DB.
+        bin.builder.position_at_end(init_bb);
+        let db_end = bin.module.get_function("db_end_i64").unwrap();
+        let end_iter = bin
+            .builder
+            .build_call(db_end, &[receiver.into(), receiver.into(), table_name.into()], "end_iter")
+            .unwrap()
+            .try_as_basic_value()
+            .left()
+            .unwrap()
+            .into_int_value();
+
+        let end_neg = bin
+            .builder
+            .build_int_compare(IntPredicate::EQ, end_iter, i32_ty.const_int(u64::MAX, true), "end_neg")
+            .unwrap();
+
+        let empty_bb = bin.context.append_basic_block(function, "str_empty");
+        let has_rows_bb = bin.context.append_basic_block(function, "str_has_rows");
+        let init_done_bb = bin.context.append_basic_block(function, "str_init_done");
+
+        bin.builder.build_conditional_branch(end_neg, empty_bb, has_rows_bb).unwrap();
+
+        bin.builder.position_at_end(empty_bb);
+        let pk_zero = i64_ty.const_zero();
+        bin.builder.build_unconditional_branch(init_done_bb).unwrap();
+
+        bin.builder.position_at_end(has_rows_bb);
+        let last_pk_out = bin.builder.build_alloca(i64_ty, "last_pk_out").unwrap();
+        let db_previous = bin.module.get_function("db_previous_i64").unwrap();
+        bin.builder.build_call(db_previous, &[end_iter.into(), last_pk_out.into()], "").unwrap();
+        let last_pk = bin.builder.build_load(i64_ty, last_pk_out, "last_pk").unwrap().into_int_value();
+        let pk_from_db = bin.builder.build_int_add(last_pk, i64_ty.const_int(1, false), "pk_from_db").unwrap();
+        bin.builder.build_unconditional_branch(init_done_bb).unwrap();
+
+        bin.builder.position_at_end(init_done_bb);
+        let init_pk = bin.builder.build_phi(i64_ty, "init_pk").unwrap();
+        init_pk.add_incoming(&[(&pk_zero, empty_bb), (&pk_from_db, has_rows_bb)]);
+        let init_pk_val = init_pk.as_basic_value().into_int_value();
+        bin.builder.build_unconditional_branch(do_insert_bb).unwrap();
+
+        bin.builder.position_at_end(use_cached_bb);
+        bin.builder.build_unconditional_branch(do_insert_bb).unwrap();
+
+        bin.builder.position_at_end(do_insert_bb);
+        let new_pk = bin.builder.build_phi(i64_ty, "new_pk").unwrap();
+        new_pk.add_incoming(&[(&init_pk_val, init_done_bb), (&cached_pk, use_cached_bb)]);
+        let new_pk_val = new_pk.as_basic_value().into_int_value();
+
+        bin.builder.build_store(row_buf, new_pk_val).unwrap();
+
+        let next_pk_inc = bin
+            .builder
+            .build_int_add(new_pk_val, i64_ty.const_int(1, false), "next_pk_inc")
+            .unwrap();
+        bin.builder.build_store(pk_global.as_pointer_value(), next_pk_inc).unwrap();
+
+        let db_store = bin.module.get_function("db_store_i64").unwrap();
+        bin.builder
+            .build_call(
+                db_store,
+                &[receiver.into(), table_name.into(), receiver.into(), new_pk_val.into(), row_buf.into(), row_size.into()],
+                "",
+            )
+            .unwrap();
+
+        let db_idx256_store = bin.module.get_function("db_idx256_store").unwrap();
+        bin.builder
+            .build_call(
+                db_idx256_store,
+                &[receiver.into(), table_name.into(), receiver.into(), new_pk_val.into(), slot_buf.into(), data_len.into()],
+                "",
+            )
+            .unwrap();
+
+        bin.builder.build_unconditional_branch(done_bb).unwrap();
+        bin.builder.position_at_end(done_bb);
+    }
+
+    /// Load a string from the state table into a Solang vector.
+    /// Row format: [pk(8) + slot_hash(32) + string_bytes(N)].
+    /// Returns a pointer to a new vector (or empty vector if not found).
+    fn storage_load_string<'a>(
+        &self,
+        bin: &Binary<'a>,
+        slot: &mut IntValue<'a>,
+        function: FunctionValue,
+    ) -> PointerValue<'a> {
+        let i32_ty = bin.context.i32_type();
+        let i64_ty = bin.context.i64_type();
+        let i256_ty = bin.context.custom_width_int_type(256);
+
+        // Load receiver.
+        let receiver_global = Self::get_receiver_global(bin);
+        let receiver = bin
+            .builder
+            .build_load(i64_ty, receiver_global.as_pointer_value(), "receiver")
+            .unwrap()
+            .into_int_value();
+        let table_name = i64_ty.const_int(STATE_TABLE_NAME, false);
+
+        // Convert slot to 256-bit.
+        let slot_i256 = if slot.get_type().get_bit_width() == 256 {
+            *slot
+        } else {
+            bin.builder
+                .build_int_z_extend(*slot, i256_ty, "slot256")
+                .unwrap()
+        };
+        let slot_buf = bin
+            .builder
+            .build_array_alloca(bin.context.i8_type(), i32_ty.const_int(32, false), "slot_buf")
+            .unwrap();
+        bin.builder.build_store(slot_buf, slot_i256).unwrap();
+
+        // Look up via idx256.
+        let pk_out = bin.builder.build_alloca(i64_ty, "pk_out").unwrap();
+        let db_idx256_find = bin.module.get_function("db_idx256_find_secondary").unwrap();
+        let data_len = i32_ty.const_int(2, false);
+        let sec_iter = bin
+            .builder
+            .build_call(
+                db_idx256_find,
+                &[receiver.into(), receiver.into(), table_name.into(), slot_buf.into(), data_len.into(), pk_out.into()],
+                "sec_iter",
+            )
+            .unwrap()
+            .try_as_basic_value()
+            .left()
+            .unwrap()
+            .into_int_value();
+
+        let found = bin
+            .builder
+            .build_int_compare(IntPredicate::SGE, sec_iter, i32_ty.const_zero(), "found")
+            .unwrap();
+
+        // Allocate scratch buffer before branching (must dominate both paths).
+        let scratch_buf = bin.builder.build_alloca(bin.context.i8_type(), "scratch").unwrap();
+        let vector_new = bin.module.get_function("vector_new").unwrap();
+        let db_find = bin.module.get_function("db_find_i64").unwrap();
+        let db_get = bin.module.get_function("db_get_i64").unwrap();
+        let malloc = bin.module.get_function("__malloc").unwrap();
+
+        let found_bb = bin.context.append_basic_block(function, "str_found");
+        let notfound_bb = bin.context.append_basic_block(function, "str_notfound");
+        let merge_bb = bin.context.append_basic_block(function, "str_merge");
+
+        bin.builder.build_conditional_branch(found, found_bb, notfound_bb).unwrap();
+
+        // FOUND: read row, extract string bytes, create vector.
+        bin.builder.position_at_end(found_bb);
+        let pk = bin.builder.build_load(i64_ty, pk_out, "pk").unwrap().into_int_value();
+
+        let pri_iter = bin
+            .builder
+            .build_call(db_find, &[receiver.into(), receiver.into(), table_name.into(), pk.into()], "pri_iter")
+            .unwrap()
+            .try_as_basic_value()
+            .left()
+            .unwrap()
+            .into_int_value();
+        let row_total_size = bin
+            .builder
+            .build_call(db_get, &[pri_iter.into(), scratch_buf.into(), i32_ty.const_zero().into()], "row_size")
+            .unwrap()
+            .try_as_basic_value()
+            .left()
+            .unwrap()
+            .into_int_value();
+
+        // String length = row_total_size - 40 (pk + hash header).
+        let header_size = i32_ty.const_int(40, false);
+        let str_len = bin
+            .builder
+            .build_int_sub(row_total_size, header_size, "str_len")
+            .unwrap();
+
+        // Allocate row buffer via malloc (dynamic size).
+        let malloc = bin.module.get_function("__malloc").unwrap();
+        let row_buf = bin
+            .builder
+            .build_call(malloc, &[row_total_size.into()], "row_buf")
+            .unwrap()
+            .try_as_basic_value()
+            .left()
+            .unwrap()
+            .into_pointer_value();
+
+        // Need to re-find since db_get_i64 may have invalidated the iterator.
+        let pri_iter2 = bin
+            .builder
+            .build_call(db_find, &[receiver.into(), receiver.into(), table_name.into(), pk.into()], "pri_iter2")
+            .unwrap()
+            .try_as_basic_value()
+            .left()
+            .unwrap()
+            .into_int_value();
+
+        bin.builder
+            .build_call(db_get, &[pri_iter2.into(), row_buf.into(), row_total_size.into()], "")
+            .unwrap();
+
+        // String data starts at offset 40.
+        let str_ptr = unsafe {
+            bin.builder
+                .build_gep(bin.context.i8_type(), row_buf, &[header_size], "str_ptr")
+                .unwrap()
+        };
+
+        // Create a vector: vector_new(len, 1, data_ptr).
+        let found_vec = bin
+            .builder
+            .build_call(
+                vector_new,
+                &[str_len.into(), i32_ty.const_int(1, false).into(), str_ptr.into()],
+                "str_vec",
+            )
+            .unwrap()
+            .try_as_basic_value()
+            .left()
+            .unwrap()
+            .into_pointer_value();
+        bin.builder.build_unconditional_branch(merge_bb).unwrap();
+
+        // NOT FOUND: return empty vector.
+        bin.builder.position_at_end(notfound_bb);
+        let empty_vec = bin
+            .builder
+            .build_call(
+                vector_new,
+                &[i32_ty.const_zero().into(), i32_ty.const_int(1, false).into(), scratch_buf.into()],
+                "empty_vec",
+            )
+            .unwrap()
+            .try_as_basic_value()
+            .left()
+            .unwrap()
+            .into_pointer_value();
+        bin.builder.build_unconditional_branch(merge_bb).unwrap();
+
+        // MERGE.
+        bin.builder.position_at_end(merge_bb);
+        let ptr_ty = bin.context.ptr_type(inkwell::AddressSpace::default());
+        let phi = bin.builder.build_phi(ptr_ty, "str_result").unwrap();
+        phi.add_incoming(&[(&found_vec, found_bb), (&empty_vec, notfound_bb)]);
+        phi.as_basic_value().into_pointer_value()
     }
 }
