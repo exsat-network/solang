@@ -156,19 +156,93 @@ impl AntelopeTarget {
             void_ty.fn_type(&[ptr_ty.into(), i32_ty.into(), ptr_ty.into()], false);
         bin.module
             .add_function("sha256", sha256_ty, Some(Linkage::External));
+
+        // int32_t db_end_i64(uint64_t code, uint64_t scope, uint64_t table)
+        let db_end_ty = i32_ty.fn_type(
+            &[i64_ty.into(), i64_ty.into(), i64_ty.into()],
+            false,
+        );
+        bin.module
+            .add_function("db_end_i64", db_end_ty, Some(Linkage::External));
+
+        // int32_t db_previous_i64(int32_t iterator, uint64_t* primary)
+        let db_previous_ty = i32_ty.fn_type(&[i32_ty.into(), ptr_ty.into()], false);
+        bin.module
+            .add_function("db_previous_i64", db_previous_ty, Some(Linkage::External));
+
+        // int32_t db_idx256_store(uint64_t scope, uint64_t table, uint64_t payer, uint64_t id, const uint128_t data[], uint32_t data_len)
+        let db_idx256_store_ty = i32_ty.fn_type(
+            &[
+                i64_ty.into(),
+                i64_ty.into(),
+                i64_ty.into(),
+                i64_ty.into(),
+                ptr_ty.into(),
+                i32_ty.into(),
+            ],
+            false,
+        );
+        bin.module.add_function(
+            "db_idx256_store",
+            db_idx256_store_ty,
+            Some(Linkage::External),
+        );
+
+        // int32_t db_idx256_find_secondary(uint64_t code, uint64_t scope, uint64_t table, const uint128_t data[], uint32_t data_len, uint64_t* primary)
+        let db_idx256_find_ty = i32_ty.fn_type(
+            &[
+                i64_ty.into(),
+                i64_ty.into(),
+                i64_ty.into(),
+                ptr_ty.into(),
+                i32_ty.into(),
+                ptr_ty.into(),
+            ],
+            false,
+        );
+        bin.module.add_function(
+            "db_idx256_find_secondary",
+            db_idx256_find_ty,
+            Some(Linkage::External),
+        );
+
+        // void db_idx256_update(int32_t iterator, uint64_t payer, const uint128_t data[], uint32_t data_len)
+        let db_idx256_update_ty = void_ty.fn_type(
+            &[i32_ty.into(), i64_ty.into(), ptr_ty.into(), i32_ty.into()],
+            false,
+        );
+        bin.module.add_function(
+            "db_idx256_update",
+            db_idx256_update_ty,
+            Some(Linkage::External),
+        );
     }
 
-    /// Add a WASM global to store the `receiver` account name (set in apply()).
+    /// Add WASM globals for receiver and auto-increment pk cache.
     fn add_receiver_global(bin: &mut Binary) {
         let i64_ty = bin.context.i64_type();
+
+        // __receiver: stores the current contract's account name (set in apply()).
         let global = bin.module.add_global(i64_ty, None, "__receiver");
         global.set_initializer(&i64_ty.const_zero());
         global.set_linkage(Linkage::Internal);
+
+        // __next_pk: cached next primary key for auto-increment storage inserts.
+        // Initialized to UINT64_MAX as sentinel meaning "not yet computed".
+        // On first insert, computed via db_end_i64/db_previous_i64, then incremented.
+        let pk_global = bin.module.add_global(i64_ty, None, "__next_pk");
+        pk_global.set_initializer(&i64_ty.const_all_ones()); // UINT64_MAX sentinel
+        pk_global.set_linkage(Linkage::Internal);
     }
 
     /// Get the __receiver global value.
     pub fn get_receiver_global<'a>(bin: &Binary<'a>) -> GlobalValue<'a> {
         bin.module.get_global("__receiver").unwrap()
+    }
+
+    /// Get the __next_pk global value.
+    pub fn get_next_pk_global<'a>(bin: &Binary<'a>) -> GlobalValue<'a> {
+        bin.module.get_global("__next_pk").unwrap()
     }
 
     fn emit_functions<'a>(contract: &'a ast::Contract, bin: &mut Binary<'a>) {

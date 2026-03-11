@@ -21,8 +21,10 @@ use solang_parser::pt::{Loc, StorageType};
 use std::collections::HashMap;
 
 // Antelope TargetRuntime implementation.
-// Storage model: one "state" table per contract. Primary key = slot number.
-// Each row stores raw bytes of the state variable value.
+// Storage model: one "state" table per contract.
+// Lookup via idx256 secondary index (full 256-bit slot hash).
+// Auto-increment primary key (like CDT available_primary_key).
+// Row data = raw value bytes only.
 #[allow(unused_variables)]
 impl<'a> TargetRuntime<'a> for AntelopeTarget {
     fn get_storage_int(
@@ -35,12 +37,13 @@ impl<'a> TargetRuntime<'a> for AntelopeTarget {
         todo!("antelope: get_storage_int")
     }
 
-    /// Load a value from Antelope table storage.
+    /// Load a value from Antelope table storage via idx256 secondary index.
     ///
     /// 1. receiver = load __receiver global
-    /// 2. iter = db_find_i64(receiver, receiver, STATE_TABLE_NAME, slot)
-    /// 3. if iter >= 0: db_get_i64(iter, &buf, size); return load(buf)
-    /// 4. else: return zero
+    /// 2. Convert slot to 256-bit hash, store to stack buffer
+    /// 3. sec_iter = db_idx256_find_secondary(receiver, receiver, table, slot_buf, 2, &pk)
+    /// 4. if sec_iter >= 0: db_find_i64(pk) → db_get_i64 → return value
+    /// 5. else: return zero
     fn storage_load(
         &self,
         bin: &Binary<'a>,
@@ -51,8 +54,8 @@ impl<'a> TargetRuntime<'a> for AntelopeTarget {
     ) -> BasicValueEnum<'a> {
         let i32_ty = bin.context.i32_type();
         let i64_ty = bin.context.i64_type();
+        let i256_ty = bin.context.custom_width_int_type(256);
 
-        // Determine byte size of the value being stored.
         let bits = ty.bits(bin.ns) as u32;
         let byte_size = (bits + 7) / 8;
 
@@ -64,34 +67,53 @@ impl<'a> TargetRuntime<'a> for AntelopeTarget {
             .unwrap()
             .into_int_value();
 
-        // Slot as u64 (truncate if wider, extend if narrower).
-        let slot_i64 = if slot.get_type().get_bit_width() == 64 {
+        let table_name = i64_ty.const_int(STATE_TABLE_NAME, false);
+
+        // Convert slot to 256-bit value and store to stack buffer.
+        let slot_i256 = if slot.get_type().get_bit_width() == 256 {
             *slot
-        } else if slot.get_type().get_bit_width() > 64 {
+        } else if slot.get_type().get_bit_width() > 256 {
             bin.builder
-                .build_int_truncate(*slot, i64_ty, "slot64")
+                .build_int_truncate(*slot, i256_ty, "slot256")
                 .unwrap()
         } else {
             bin.builder
-                .build_int_z_extend(*slot, i64_ty, "slot64")
+                .build_int_z_extend(*slot, i256_ty, "slot256")
                 .unwrap()
         };
 
-        let table_name = i64_ty.const_int(STATE_TABLE_NAME, false);
+        let slot_buf = bin
+            .builder
+            .build_array_alloca(
+                bin.context.i8_type(),
+                i32_ty.const_int(32, false),
+                "slot_buf",
+            )
+            .unwrap();
+        bin.builder.build_store(slot_buf, slot_i256).unwrap();
 
-        // Call db_find_i64(receiver, receiver, table, slot).
-        let db_find = bin.module.get_function("db_find_i64").unwrap();
-        let iter = bin
+        // Allocate output for primary key.
+        let pk_out = bin.builder.build_alloca(i64_ty, "pk_out").unwrap();
+
+        // Look up via idx256 secondary index.
+        let db_idx256_find = bin
+            .module
+            .get_function("db_idx256_find_secondary")
+            .unwrap();
+        let data_len = i32_ty.const_int(2, false); // 2 x uint128_t = 256 bits
+        let sec_iter = bin
             .builder
             .build_call(
-                db_find,
+                db_idx256_find,
                 &[
                     receiver.into(),
                     receiver.into(),
                     table_name.into(),
-                    slot_i64.into(),
+                    slot_buf.into(),
+                    data_len.into(),
+                    pk_out.into(),
                 ],
-                "iter",
+                "sec_iter",
             )
             .unwrap()
             .try_as_basic_value()
@@ -99,33 +121,57 @@ impl<'a> TargetRuntime<'a> for AntelopeTarget {
             .unwrap()
             .into_int_value();
 
-        // Check if iter >= 0 (found).
+        // Check if found (iter >= 0).
         let found = bin
             .builder
             .build_int_compare(
                 IntPredicate::SGE,
-                iter,
+                sec_iter,
                 i32_ty.const_zero(),
                 "found",
             )
             .unwrap();
 
-        let found_bb = bin.context.append_basic_block(function, "db_found");
-        let notfound_bb = bin.context.append_basic_block(function, "db_notfound");
-        let merge_bb = bin.context.append_basic_block(function, "db_merge");
+        let found_bb = bin.context.append_basic_block(function, "idx_found");
+        let notfound_bb = bin.context.append_basic_block(function, "idx_notfound");
+        let merge_bb = bin.context.append_basic_block(function, "idx_merge");
 
         bin.builder
             .build_conditional_branch(found, found_bb, notfound_bb)
             .unwrap();
 
-        // FOUND: read row from table.
-        // Row format: [key: u64, value: N bytes] to match Antelope ABI.
+        // FOUND: look up primary row by pk, then read value.
         bin.builder.position_at_end(found_bb);
 
         let val_ty = bin.context.custom_width_int_type(bits);
-        let row_size = 8 + byte_size; // key (8 bytes) + value
+        let pk = bin
+            .builder
+            .build_load(i64_ty, pk_out, "pk")
+            .unwrap()
+            .into_int_value();
 
-        // Allocate row buffer on stack.
+        // Find primary row by pk.
+        let db_find = bin.module.get_function("db_find_i64").unwrap();
+        let pri_iter = bin
+            .builder
+            .build_call(
+                db_find,
+                &[
+                    receiver.into(),
+                    receiver.into(),
+                    table_name.into(),
+                    pk.into(),
+                ],
+                "pri_iter",
+            )
+            .unwrap()
+            .try_as_basic_value()
+            .left()
+            .unwrap()
+            .into_int_value();
+
+        // Read row data: [pk: u64, slot_hash: checksum256, value: N bytes].
+        let row_size = 8 + 32 + byte_size; // pk(8) + hash(32) + value(N)
         let row_buf = bin
             .builder
             .build_array_alloca(
@@ -136,22 +182,25 @@ impl<'a> TargetRuntime<'a> for AntelopeTarget {
             .unwrap();
 
         let db_get = bin.module.get_function("db_get_i64").unwrap();
-        let row_size_const = i32_ty.const_int(row_size as u64, false);
         bin.builder
             .build_call(
                 db_get,
-                &[iter.into(), row_buf.into(), row_size_const.into()],
+                &[
+                    pri_iter.into(),
+                    row_buf.into(),
+                    i32_ty.const_int(row_size as u64, false).into(),
+                ],
                 "",
             )
             .unwrap();
 
-        // Value starts at offset 8 (after the key).
+        // Value starts at offset 40 (after pk + slot_hash).
         let val_ptr = unsafe {
             bin.builder
                 .build_gep(
                     bin.context.i8_type(),
                     row_buf,
-                    &[i32_ty.const_int(8, false)],
+                    &[i32_ty.const_int(40, false)],
                     "val_ptr",
                 )
                 .unwrap()
@@ -180,13 +229,14 @@ impl<'a> TargetRuntime<'a> for AntelopeTarget {
         phi.as_basic_value()
     }
 
-    /// Store a value to Antelope table storage.
+    /// Store a value to Antelope table storage via idx256 secondary index.
     ///
     /// 1. receiver = load __receiver global
-    /// 2. iter = db_find_i64(receiver, receiver, STATE_TABLE_NAME, slot)
-    /// 3. store dest bytes to stack buffer
-    /// 4. if iter >= 0: db_update_i64(iter, receiver, &buf, size)
-    /// 5. else: db_store_i64(receiver, STATE_TABLE_NAME, receiver, slot, &buf, size)
+    /// 2. Convert slot to 256-bit hash buffer
+    /// 3. sec_iter = db_idx256_find_secondary(receiver, receiver, table, slot_buf, 2, &pk)
+    /// 4. if found: db_find_i64(pk) → db_update_i64(pri_iter, receiver, &val, size)
+    /// 5. else: new_pk = available_primary_key() via db_end_i64/db_previous_i64
+    ///          db_store_i64(new_pk, &val) + db_idx256_store(new_pk, slot_buf)
     fn storage_store(
         &self,
         bin: &Binary<'a>,
@@ -199,6 +249,7 @@ impl<'a> TargetRuntime<'a> for AntelopeTarget {
     ) {
         let i32_ty = bin.context.i32_type();
         let i64_ty = bin.context.i64_type();
+        let i256_ty = bin.context.custom_width_int_type(256);
 
         let bits = ty.bits(bin.ns) as u32;
         let byte_size = (bits + 7) / 8;
@@ -211,25 +262,34 @@ impl<'a> TargetRuntime<'a> for AntelopeTarget {
             .unwrap()
             .into_int_value();
 
-        let slot_i64 = if slot.get_type().get_bit_width() == 64 {
+        let table_name = i64_ty.const_int(STATE_TABLE_NAME, false);
+
+        // Convert slot to 256-bit value and store to stack buffer.
+        let slot_i256 = if slot.get_type().get_bit_width() == 256 {
             *slot
-        } else if slot.get_type().get_bit_width() > 64 {
+        } else if slot.get_type().get_bit_width() > 256 {
             bin.builder
-                .build_int_truncate(*slot, i64_ty, "slot64")
+                .build_int_truncate(*slot, i256_ty, "slot256")
                 .unwrap()
         } else {
             bin.builder
-                .build_int_z_extend(*slot, i64_ty, "slot64")
+                .build_int_z_extend(*slot, i256_ty, "slot256")
                 .unwrap()
         };
 
-        let table_name = i64_ty.const_int(STATE_TABLE_NAME, false);
+        let slot_buf = bin
+            .builder
+            .build_array_alloca(
+                bin.context.i8_type(),
+                i32_ty.const_int(32, false),
+                "slot_buf",
+            )
+            .unwrap();
+        bin.builder.build_store(slot_buf, slot_i256).unwrap();
 
-        // Row format: [key: u64, value: N bytes] to match Antelope ABI.
+        // Row format: [pk: u64, slot_hash: checksum256, value: N bytes].
         let val_ty = bin.context.custom_width_int_type(bits);
-        let row_size = 8 + byte_size; // key (8 bytes) + value
-
-        // Allocate row buffer on stack.
+        let row_size = 8 + 32 + byte_size; // pk(8) + hash(32) + value(N)
         let row_buf = bin
             .builder
             .build_array_alloca(
@@ -239,16 +299,26 @@ impl<'a> TargetRuntime<'a> for AntelopeTarget {
             )
             .unwrap();
 
-        // Write key (slot) at offset 0.
-        bin.builder.build_store(row_buf, slot_i64).unwrap();
-
-        // Write value at offset 8.
-        let val_ptr = unsafe {
+        // Write slot_hash at offset 8.
+        let hash_ptr = unsafe {
             bin.builder
                 .build_gep(
                     bin.context.i8_type(),
                     row_buf,
                     &[i32_ty.const_int(8, false)],
+                    "hash_ptr",
+                )
+                .unwrap()
+        };
+        bin.builder.build_store(hash_ptr, slot_i256).unwrap();
+
+        // Write value at offset 40 (8 + 32).
+        let val_ptr = unsafe {
+            bin.builder
+                .build_gep(
+                    bin.context.i8_type(),
+                    row_buf,
+                    &[i32_ty.const_int(40, false)],
                     "val_ptr",
                 )
                 .unwrap()
@@ -269,20 +339,27 @@ impl<'a> TargetRuntime<'a> for AntelopeTarget {
         bin.builder.build_store(val_ptr, store_val).unwrap();
 
         let row_size_const = i32_ty.const_int(row_size as u64, false);
+        let data_len = i32_ty.const_int(2, false); // 2 x uint128_t = 256 bits
 
-        // Check if row already exists.
-        let db_find = bin.module.get_function("db_find_i64").unwrap();
-        let iter = bin
+        // Look up via idx256 secondary index.
+        let pk_out = bin.builder.build_alloca(i64_ty, "pk_out").unwrap();
+        let db_idx256_find = bin
+            .module
+            .get_function("db_idx256_find_secondary")
+            .unwrap();
+        let sec_iter = bin
             .builder
             .build_call(
-                db_find,
+                db_idx256_find,
                 &[
                     receiver.into(),
                     receiver.into(),
                     table_name.into(),
-                    slot_i64.into(),
+                    slot_buf.into(),
+                    data_len.into(),
+                    pk_out.into(),
                 ],
-                "iter",
+                "sec_iter",
             )
             .unwrap()
             .try_as_basic_value()
@@ -292,31 +369,191 @@ impl<'a> TargetRuntime<'a> for AntelopeTarget {
 
         let found = bin
             .builder
-            .build_int_compare(IntPredicate::SGE, iter, i32_ty.const_zero(), "found")
+            .build_int_compare(
+                IntPredicate::SGE,
+                sec_iter,
+                i32_ty.const_zero(),
+                "found",
+            )
             .unwrap();
 
-        let update_bb = bin.context.append_basic_block(function, "db_update");
-        let insert_bb = bin.context.append_basic_block(function, "db_insert");
-        let done_bb = bin.context.append_basic_block(function, "db_done");
+        let update_bb = bin.context.append_basic_block(function, "idx_update");
+        let insert_bb = bin.context.append_basic_block(function, "idx_insert");
+        let done_bb = bin.context.append_basic_block(function, "idx_done");
 
         bin.builder
             .build_conditional_branch(found, update_bb, insert_bb)
             .unwrap();
 
-        // UPDATE existing row.
+        // UPDATE existing row: write pk at offset 0, find primary, then update.
         bin.builder.position_at_end(update_bb);
+        let pk = bin
+            .builder
+            .build_load(i64_ty, pk_out, "pk")
+            .unwrap()
+            .into_int_value();
+        // Write pk at offset 0 of row_buf.
+        bin.builder.build_store(row_buf, pk).unwrap();
+
+        let db_find = bin.module.get_function("db_find_i64").unwrap();
+        let pri_iter = bin
+            .builder
+            .build_call(
+                db_find,
+                &[
+                    receiver.into(),
+                    receiver.into(),
+                    table_name.into(),
+                    pk.into(),
+                ],
+                "pri_iter",
+            )
+            .unwrap()
+            .try_as_basic_value()
+            .left()
+            .unwrap()
+            .into_int_value();
         let db_update = bin.module.get_function("db_update_i64").unwrap();
         bin.builder
             .build_call(
                 db_update,
-                &[iter.into(), receiver.into(), row_buf.into(), row_size_const.into()],
+                &[
+                    pri_iter.into(),
+                    receiver.into(),
+                    row_buf.into(),
+                    row_size_const.into(),
+                ],
                 "",
             )
             .unwrap();
         bin.builder.build_unconditional_branch(done_bb).unwrap();
 
-        // INSERT new row.
+        // INSERT new row with auto-increment primary key.
+        // Uses cached __next_pk global: UINT64_MAX sentinel means "compute from DB".
+        // After first compute, just increment the cached value for each insert.
         bin.builder.position_at_end(insert_bb);
+
+        let pk_global = AntelopeTarget::get_next_pk_global(bin);
+        let cached_pk = bin
+            .builder
+            .build_load(i64_ty, pk_global.as_pointer_value(), "cached_pk")
+            .unwrap()
+            .into_int_value();
+
+        let sentinel = i64_ty.const_all_ones(); // UINT64_MAX
+        let need_init = bin
+            .builder
+            .build_int_compare(IntPredicate::EQ, cached_pk, sentinel, "need_init")
+            .unwrap();
+
+        let init_bb = bin.context.append_basic_block(function, "pk_init");
+        let use_cached_bb = bin.context.append_basic_block(function, "pk_cached");
+        let do_insert_bb = bin.context.append_basic_block(function, "do_insert");
+
+        bin.builder
+            .build_conditional_branch(need_init, init_bb, use_cached_bb)
+            .unwrap();
+
+        // INIT: compute next pk from database via db_end_i64/db_previous_i64.
+        bin.builder.position_at_end(init_bb);
+        let db_end = bin.module.get_function("db_end_i64").unwrap();
+        let end_iter = bin
+            .builder
+            .build_call(
+                db_end,
+                &[receiver.into(), receiver.into(), table_name.into()],
+                "end_iter",
+            )
+            .unwrap()
+            .try_as_basic_value()
+            .left()
+            .unwrap()
+            .into_int_value();
+
+        // db_end_i64 returns -1 for empty table, < -1 for valid end iterator.
+        let end_neg = bin
+            .builder
+            .build_int_compare(
+                IntPredicate::EQ,
+                end_iter,
+                i32_ty.const_int(u64::MAX, true), // -1
+                "end_neg",
+            )
+            .unwrap();
+
+        let empty_bb = bin.context.append_basic_block(function, "table_empty");
+        let has_rows_bb = bin.context.append_basic_block(function, "table_has_rows");
+        let init_done_bb = bin.context.append_basic_block(function, "pk_init_done");
+
+        bin.builder
+            .build_conditional_branch(end_neg, empty_bb, has_rows_bb)
+            .unwrap();
+
+        // Table empty: start at pk = 0.
+        bin.builder.position_at_end(empty_bb);
+        let pk_zero = i64_ty.const_zero();
+        bin.builder
+            .build_unconditional_branch(init_done_bb)
+            .unwrap();
+
+        // Table has rows: get last pk via db_previous_i64, use pk + 1.
+        bin.builder.position_at_end(has_rows_bb);
+        let last_pk_out = bin.builder.build_alloca(i64_ty, "last_pk_out").unwrap();
+        let db_previous = bin.module.get_function("db_previous_i64").unwrap();
+        bin.builder
+            .build_call(
+                db_previous,
+                &[end_iter.into(), last_pk_out.into()],
+                "",
+            )
+            .unwrap();
+        let last_pk = bin
+            .builder
+            .build_load(i64_ty, last_pk_out, "last_pk")
+            .unwrap()
+            .into_int_value();
+        let pk_from_db = bin
+            .builder
+            .build_int_add(last_pk, i64_ty.const_int(1, false), "pk_from_db")
+            .unwrap();
+        bin.builder
+            .build_unconditional_branch(init_done_bb)
+            .unwrap();
+
+        // Merge init result.
+        bin.builder.position_at_end(init_done_bb);
+        let init_pk = bin.builder.build_phi(i64_ty, "init_pk").unwrap();
+        init_pk.add_incoming(&[(&pk_zero, empty_bb), (&pk_from_db, has_rows_bb)]);
+        let init_pk_val = init_pk.as_basic_value().into_int_value();
+        bin.builder
+            .build_unconditional_branch(do_insert_bb)
+            .unwrap();
+
+        // USE CACHED: just use the cached value directly.
+        bin.builder.position_at_end(use_cached_bb);
+        bin.builder
+            .build_unconditional_branch(do_insert_bb)
+            .unwrap();
+
+        // Do the actual insert with the chosen pk, then increment __next_pk.
+        bin.builder.position_at_end(do_insert_bb);
+        let new_pk = bin.builder.build_phi(i64_ty, "new_pk").unwrap();
+        new_pk.add_incoming(&[(&init_pk_val, init_done_bb), (&cached_pk, use_cached_bb)]);
+        let new_pk_val = new_pk.as_basic_value().into_int_value();
+
+        // Write new_pk at offset 0 of row_buf.
+        bin.builder.build_store(row_buf, new_pk_val).unwrap();
+
+        // Increment and store back to __next_pk for next insert.
+        let next_pk_inc = bin
+            .builder
+            .build_int_add(new_pk_val, i64_ty.const_int(1, false), "next_pk_inc")
+            .unwrap();
+        bin.builder
+            .build_store(pk_global.as_pointer_value(), next_pk_inc)
+            .unwrap();
+
+        // db_store_i64(scope, table, payer, id, data, len)
         let db_store = bin.module.get_function("db_store_i64").unwrap();
         bin.builder
             .build_call(
@@ -325,13 +562,31 @@ impl<'a> TargetRuntime<'a> for AntelopeTarget {
                     receiver.into(),
                     table_name.into(),
                     receiver.into(),
-                    slot_i64.into(),
+                    new_pk_val.into(),
                     row_buf.into(),
                     row_size_const.into(),
                 ],
                 "",
             )
             .unwrap();
+
+        // db_idx256_store(scope, table, payer, id, data, data_len)
+        let db_idx256_store = bin.module.get_function("db_idx256_store").unwrap();
+        bin.builder
+            .build_call(
+                db_idx256_store,
+                &[
+                    receiver.into(),
+                    table_name.into(),
+                    receiver.into(),
+                    new_pk_val.into(),
+                    slot_buf.into(),
+                    data_len.into(),
+                ],
+                "",
+            )
+            .unwrap();
+
         bin.builder.build_unconditional_branch(done_bb).unwrap();
 
         bin.builder.position_at_end(done_bb);
