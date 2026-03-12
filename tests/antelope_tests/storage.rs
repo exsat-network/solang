@@ -1,0 +1,170 @@
+// SPDX-License-Identifier: Apache-2.0
+
+use crate::{build_solidity, encode_action_data, ActionParam};
+
+#[test]
+fn mapping_store_and_load() {
+    let mut vm = build_solidity(
+        r#"
+        contract Test {
+            mapping(uint64 => uint64) public data;
+
+            function store(uint64 key, uint64 val) public {
+                data[key] = val;
+            }
+
+            function load(uint64 key) public {
+                if (data[key] != 0) {
+                    print("found");
+                } else {
+                    print("empty");
+                }
+            }
+        }
+        "#,
+    );
+
+    // Store a value
+    let data = encode_action_data(&[ActionParam::U64(1), ActionParam::U64(42)]);
+    vm.action("store", data);
+    assert!(!vm.tables().is_empty(), "storage should have been written");
+
+    // Load it back — should find it
+    let data = encode_action_data(&[ActionParam::U64(1)]);
+    vm.action("load", data);
+    assert_eq!(vm.prints(), "found");
+
+    // Load a different key — should be empty
+    let data = encode_action_data(&[ActionParam::U64(999)]);
+    vm.action("load", data);
+    assert_eq!(vm.prints(), "empty");
+}
+
+#[test]
+fn storage_overwrite() {
+    let mut vm = build_solidity(
+        r#"
+        contract Test {
+            uint64 public val;
+
+            function setval(uint64 v) public {
+                val = v;
+            }
+
+            function check(uint64 expected) public {
+                if (val == expected) {
+                    print("match");
+                } else {
+                    print("mismatch");
+                }
+            }
+        }
+        "#,
+    );
+
+    let data = encode_action_data(&[ActionParam::U64(10)]);
+    vm.action("setval", data);
+    let rows_after_first: usize = vm.tables().values().map(|t| t.rows.len()).sum();
+
+    // Verify value is 10
+    let data = encode_action_data(&[ActionParam::U64(10)]);
+    vm.action("check", data);
+    assert_eq!(vm.prints(), "match");
+
+    // Overwrite with 20
+    let data = encode_action_data(&[ActionParam::U64(20)]);
+    vm.action("setval", data);
+    let rows_after_second: usize = vm.tables().values().map(|t| t.rows.len()).sum();
+
+    // Row count shouldn't grow (update path, not insert)
+    assert_eq!(rows_after_first, rows_after_second, "overwrite should not add rows");
+
+    // Verify value is now 20, not 10
+    let data = encode_action_data(&[ActionParam::U64(20)]);
+    vm.action("check", data);
+    assert_eq!(vm.prints(), "match");
+
+    let data = encode_action_data(&[ActionParam::U64(10)]);
+    vm.action("check", data);
+    assert_eq!(vm.prints(), "mismatch");
+}
+
+#[test]
+fn multiple_state_vars() {
+    let mut vm = build_solidity(
+        r#"
+        contract Test {
+            uint64 public a;
+            uint64 public b;
+
+            function setboth(uint64 va, uint64 vb) public {
+                a = va;
+                b = vb;
+            }
+        }
+        "#,
+    );
+
+    let data = encode_action_data(&[ActionParam::U64(100), ActionParam::U64(200)]);
+    vm.action("setboth", data);
+
+    // Both variables stored — should have table rows
+    let total_rows: usize = vm.tables().values().map(|t| t.rows.len()).sum();
+    assert!(total_rows >= 2, "should have at least 2 storage rows for 2 variables");
+}
+
+#[test]
+fn string_storage() {
+    let mut vm = build_solidity(
+        r#"
+        contract Test {
+            string public stored;
+
+            function save(string memory s) public {
+                stored = s;
+                print("saved");
+            }
+        }
+        "#,
+    );
+
+    let data = encode_action_data(&[ActionParam::String("hello world".to_string())]);
+    vm.action("save", data);
+    assert_eq!(vm.prints(), "saved");
+    assert!(!vm.tables().is_empty(), "string should be in storage");
+}
+
+#[test]
+fn bool_storage() {
+    let mut vm = build_solidity(
+        r#"
+        contract Test {
+            bool public flag;
+
+            function setflag(bool v) public {
+                flag = v;
+            }
+
+            function readflag() public {
+                if (flag) {
+                    print("true");
+                } else {
+                    print("false");
+                }
+            }
+        }
+        "#,
+    );
+
+    // Set true and read back
+    let data = encode_action_data(&[ActionParam::Bool(true)]);
+    vm.action("setflag", data);
+    vm.action("readflag", vec![]);
+    assert_eq!(vm.prints(), "true");
+
+    // Set false and read back — verifies overwrite works for bools
+    let data = encode_action_data(&[ActionParam::Bool(false)]);
+    vm.action("setflag", data);
+    vm.action("readflag", vec![]);
+    assert_eq!(vm.prints(), "false");
+}

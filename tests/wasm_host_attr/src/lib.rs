@@ -3,7 +3,7 @@
 use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
 use quote::{quote, ToTokens};
-use syn::{ImplItem, ItemImpl, LitInt, Type};
+use syn::{ImplItem, ItemImpl, LitInt, LitStr, Type};
 
 struct HostFn {
     name: String,
@@ -20,11 +20,16 @@ impl HostFn {
             _ => return None, // Only care about functions
         };
 
-        let module = item
-            .attrs
-            .iter()
-            .find(|attr| attr.path().get_ident().unwrap() == "seal")
-            .map(|attr| format!("seal{}", attr.parse_args::<LitInt>().unwrap()))?;
+        let module = item.attrs.iter().find_map(|attr| {
+            let ident = attr.path().get_ident()?;
+            if ident == "seal" {
+                Some(format!("seal{}", attr.parse_args::<LitInt>().unwrap()))
+            } else if ident == "host" {
+                Some(attr.parse_args::<LitStr>().unwrap().value())
+            } else {
+                None
+            }
+        })?;
 
         Some(HostFn {
             name: item.sig.ident.to_string(),
@@ -59,7 +64,8 @@ impl HostFn {
 /// Helper macro for creating wasmi host function wrappers.
 /// Should be used on a dedicated impl block on the host state type.
 ///
-/// Wraps functions with the `[seal(n)]` attribute, where n is the version number, into a wasmi host function.
+/// Wraps functions with the `[seal(n)]` attribute (module "seal{n}") or `[host("module")]`
+/// attribute (custom module name) into a wasmi host function.
 /// The function signature should match exactly the signature of the closure going into [`Func::wrap`][1].
 /// There will be two local variables brought into scope:
 /// * `mem` for accessing the memory
