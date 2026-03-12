@@ -329,6 +329,11 @@ impl AntelopeTarget {
         );
         bin.module
             .add_function("db_idx256_lowerbound", db_idx256_lb_ty, Some(Linkage::External));
+
+        // void set_action_return_value(const void* data, uint32_t len)
+        let set_action_ret_ty = void_ty.fn_type(&[ptr_ty.into(), i32_ty.into()], false);
+        bin.module
+            .add_function("set_action_return_value", set_action_ret_ty, Some(Linkage::External));
     }
 
     /// Add WASM globals for receiver and auto-increment pk cache.
@@ -779,7 +784,14 @@ impl AntelopeTarget {
 
             // Strip mangled parameter suffix: "record__uint64_uint64" → "record"
             let action_name = func_name.split("__").next().unwrap_or(func_name);
-            let action_encoded = string_to_name(action_name);
+            // Normalize to eosio::name charset (lowercase + 1-5 + dot, max 12 chars)
+            // to match the ABI action name generation.
+            let action_name_normalized: String = action_name
+                .chars()
+                .filter(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == '.')
+                .take(12)
+                .collect();
+            let action_encoded = string_to_name(&action_name_normalized);
 
             let action_const = i64_ty.const_int(action_encoded, false);
             let matches = bin
@@ -962,15 +974,111 @@ impl AntelopeTarget {
                 }
 
                 // Add output pointers for return values (passed by pointer).
+                let mut ret_allocas = Vec::new();
                 for ret in cfg.returns.iter() {
                     let ret_alloca = bin
                         .builder
                         .build_alloca(bin.llvm_var_ty(&ret.ty), "ret")
                         .unwrap();
+                    ret_allocas.push((ret_alloca, ret.ty.clone()));
                     args.push(ret_alloca.into());
                 }
 
                 bin.builder.build_call(func, &args, "").unwrap();
+
+                // Serialize return values via set_action_return_value (Leap 3.x+).
+                if !ret_allocas.is_empty() {
+                    let i32_ty = context.i32_type();
+                    // Compute total byte size of all fixed-size returns.
+                    let mut total_size: u32 = 0;
+                    let mut all_fixed = true;
+                    for (_, ty) in &ret_allocas {
+                        if let Some(sz) = Self::datastream_fixed_size(ty, bin) {
+                            total_size += sz;
+                        } else {
+                            all_fixed = false;
+                            break;
+                        }
+                    }
+
+                    if all_fixed && total_size > 0 {
+                        let set_return_fn = bin
+                            .module
+                            .get_function("set_action_return_value")
+                            .unwrap();
+
+                        if ret_allocas.len() == 1 {
+                            // Single return: pass alloca pointer directly.
+                            let (alloca, _) = &ret_allocas[0];
+                            bin.builder
+                                .build_call(
+                                    set_return_fn,
+                                    &[
+                                        (*alloca).into(),
+                                        i32_ty
+                                            .const_int(total_size as u64, false)
+                                            .into(),
+                                    ],
+                                    "",
+                                )
+                                .unwrap();
+                        } else {
+                            // Multiple returns: pack into a contiguous buffer.
+                            let ret_buf = bin
+                                .builder
+                                .build_array_alloca(
+                                    context.i8_type(),
+                                    i32_ty.const_int(total_size as u64, false),
+                                    "ret_buf",
+                                )
+                                .unwrap();
+                            let mut offset: u32 = 0;
+                            for (alloca, ty) in &ret_allocas {
+                                let sz =
+                                    Self::datastream_fixed_size(ty, bin).unwrap();
+                                let dest = unsafe {
+                                    bin.builder
+                                        .build_gep(
+                                            context.i8_type(),
+                                            ret_buf,
+                                            &[i32_ty
+                                                .const_int(offset as u64, false)],
+                                            "ret_dest",
+                                        )
+                                        .unwrap()
+                                };
+                                bin.builder
+                                    .build_call(
+                                        bin.module
+                                            .get_function("memcpy")
+                                            .unwrap(),
+                                        &[
+                                            dest.into(),
+                                            (*alloca).into(),
+                                            i32_ty
+                                                .const_int(sz as u64, false)
+                                                .into(),
+                                        ],
+                                        "",
+                                    )
+                                    .unwrap();
+                                offset += sz;
+                            }
+                            bin.builder
+                                .build_call(
+                                    set_return_fn,
+                                    &[
+                                        ret_buf.into(),
+                                        i32_ty
+                                            .const_int(total_size as u64, false)
+                                            .into(),
+                                    ],
+                                    "",
+                                )
+                                .unwrap();
+                        }
+                    }
+                }
             }
             bin.builder.build_unconditional_branch(return_bb).unwrap();
 

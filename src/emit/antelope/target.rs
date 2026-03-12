@@ -2124,7 +2124,10 @@ impl<'a> TargetRuntime<'a> for AntelopeTarget {
         data: PointerValue<'b>,
         data_len: BasicValueEnum<'b>,
     ) {
-        // Antelope actions don't return ABI data; no-op.
+        let set_return = bin.module.get_function("set_action_return_value").unwrap();
+        bin.builder
+            .build_call(set_return, &[data.into(), data_len.into()], "")
+            .unwrap();
     }
 }
 

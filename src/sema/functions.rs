@@ -661,18 +661,8 @@ pub fn contract_function(
 
         ns.functions.push(fdecl);
 
-        // Warn about return values on Antelope — inline actions cannot return data.
-        if ns.target == Target::Antelope {
-            let f = &ns.functions[func_no];
-            if f.is_public() && !f.returns.is_empty() {
-                ns.diagnostics.push(Diagnostic::warning(
-                    func.loc_prototype,
-                    "return values on public functions are ignored on Antelope. \
-                     Use state variables or events to communicate results."
-                        .to_string(),
-                ));
-            }
-        }
+        // Note: Antelope return values are passed via set_action_return_value (Leap 3.x+).
+        // Variable-length return types (string, bytes) are not yet serialized.
 
         ns.contracts[contract_no].functions.push(func_no);
 
