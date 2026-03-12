@@ -13,11 +13,11 @@ fn mapping_store_and_load() {
                 data[key] = val;
             }
 
-            function load(uint64 key) public {
-                if (data[key] != 0) {
-                    print("found");
+            function check(uint64 key, uint64 expected) public {
+                if (data[key] == expected) {
+                    print("match");
                 } else {
-                    print("empty");
+                    print("mismatch");
                 }
             }
         }
@@ -27,17 +27,21 @@ fn mapping_store_and_load() {
     // Store a value
     let data = encode_action_data(&[ActionParam::U64(1), ActionParam::U64(42)]);
     vm.action("store", data);
-    assert!(!vm.tables().is_empty(), "storage should have been written");
 
-    // Load it back — should find it
-    let data = encode_action_data(&[ActionParam::U64(1)]);
-    vm.action("load", data);
-    assert_eq!(vm.prints(), "found");
+    // Read back the exact value
+    let data = encode_action_data(&[ActionParam::U64(1), ActionParam::U64(42)]);
+    vm.action("check", data);
+    assert_eq!(vm.prints(), "match");
 
-    // Load a different key — should be empty
-    let data = encode_action_data(&[ActionParam::U64(999)]);
-    vm.action("load", data);
-    assert_eq!(vm.prints(), "empty");
+    // Wrong value should not match
+    let data = encode_action_data(&[ActionParam::U64(1), ActionParam::U64(99)]);
+    vm.action("check", data);
+    assert_eq!(vm.prints(), "mismatch");
+
+    // Non-existent key should read as 0
+    let data = encode_action_data(&[ActionParam::U64(999), ActionParam::U64(0)]);
+    vm.action("check", data);
+    assert_eq!(vm.prints(), "match");
 }
 
 #[test]
@@ -122,7 +126,10 @@ fn string_storage() {
 
             function save(string memory s) public {
                 stored = s;
-                print("saved");
+            }
+
+            function read() public {
+                print(stored);
             }
         }
         "#,
@@ -130,8 +137,10 @@ fn string_storage() {
 
     let data = encode_action_data(&[ActionParam::String("hello world".to_string())]);
     vm.action("save", data);
-    assert_eq!(vm.prints(), "saved");
-    assert!(!vm.tables().is_empty(), "string should be in storage");
+
+    // Read back the exact string
+    vm.action("read", vec![]);
+    assert_eq!(vm.prints(), "hello world");
 }
 
 #[test]
