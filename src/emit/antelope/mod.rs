@@ -274,6 +274,61 @@ impl AntelopeTarget {
         let send_inline_ty = void_ty.fn_type(&[ptr_ty.into(), i32_ty.into()], false);
         bin.module
             .add_function("send_inline", send_inline_ty, Some(Linkage::External));
+
+        // --- Table read host functions ---
+
+        // int32_t db_next_i64(int32_t iterator, uint64_t* primary)
+        let db_next_ty = i32_ty.fn_type(&[i32_ty.into(), ptr_ty.into()], false);
+        bin.module
+            .add_function("db_next_i64", db_next_ty, Some(Linkage::External));
+
+        // int32_t db_lowerbound_i64(uint64_t code, uint64_t scope, uint64_t table, uint64_t id)
+        let db_lowerbound_ty = i32_ty.fn_type(
+            &[i64_ty.into(), i64_ty.into(), i64_ty.into(), i64_ty.into()],
+            false,
+        );
+        bin.module
+            .add_function("db_lowerbound_i64", db_lowerbound_ty, Some(Linkage::External));
+
+        // int32_t db_idx64_find_secondary(uint64_t code, uint64_t scope, uint64_t table, const uint64_t* secondary, uint64_t* primary)
+        let db_idx64_find_ty = i32_ty.fn_type(
+            &[i64_ty.into(), i64_ty.into(), i64_ty.into(), ptr_ty.into(), ptr_ty.into()],
+            false,
+        );
+        bin.module
+            .add_function("db_idx64_find_secondary", db_idx64_find_ty, Some(Linkage::External));
+
+        // int32_t db_idx64_lowerbound(uint64_t code, uint64_t scope, uint64_t table, uint64_t* secondary, uint64_t* primary)
+        let db_idx64_lb_ty = i32_ty.fn_type(
+            &[i64_ty.into(), i64_ty.into(), i64_ty.into(), ptr_ty.into(), ptr_ty.into()],
+            false,
+        );
+        bin.module
+            .add_function("db_idx64_lowerbound", db_idx64_lb_ty, Some(Linkage::External));
+
+        // int32_t db_idx128_find_secondary(uint64_t code, uint64_t scope, uint64_t table, const uint128_t* secondary, uint64_t* primary)
+        let db_idx128_find_ty = i32_ty.fn_type(
+            &[i64_ty.into(), i64_ty.into(), i64_ty.into(), ptr_ty.into(), ptr_ty.into()],
+            false,
+        );
+        bin.module
+            .add_function("db_idx128_find_secondary", db_idx128_find_ty, Some(Linkage::External));
+
+        // int32_t db_idx128_lowerbound(uint64_t code, uint64_t scope, uint64_t table, uint128_t* secondary, uint64_t* primary)
+        let db_idx128_lb_ty = i32_ty.fn_type(
+            &[i64_ty.into(), i64_ty.into(), i64_ty.into(), ptr_ty.into(), ptr_ty.into()],
+            false,
+        );
+        bin.module
+            .add_function("db_idx128_lowerbound", db_idx128_lb_ty, Some(Linkage::External));
+
+        // int32_t db_idx256_lowerbound(uint64_t code, uint64_t scope, uint64_t table, const uint128_t data[], uint32_t data_len, uint64_t* primary)
+        let db_idx256_lb_ty = i32_ty.fn_type(
+            &[i64_ty.into(), i64_ty.into(), i64_ty.into(), ptr_ty.into(), i32_ty.into(), ptr_ty.into()],
+            false,
+        );
+        bin.module
+            .add_function("db_idx256_lowerbound", db_idx256_lb_ty, Some(Linkage::External));
     }
 
     /// Add WASM globals for receiver and auto-increment pk cache.
@@ -303,6 +358,12 @@ impl AntelopeTarget {
         let code_global = bin.module.add_global(i64_ty, None, "__code");
         code_global.set_initializer(&i64_ty.const_zero());
         code_global.set_linkage(Linkage::Internal);
+
+        // __last_pk: cached primary key from the last dbNext/dbIdx*Find/dbIdx*Lowerbound call.
+        // Read via antelope.lastPk(). Initialized to 0.
+        let last_pk_global = bin.module.add_global(i64_ty, None, "__last_pk");
+        last_pk_global.set_initializer(&i64_ty.const_zero());
+        last_pk_global.set_linkage(Linkage::Internal);
     }
 
     /// Get the __receiver global value.

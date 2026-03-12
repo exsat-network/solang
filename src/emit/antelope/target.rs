@@ -1635,6 +1635,340 @@ impl<'a> TargetRuntime<'a> for AntelopeTarget {
                     .build_call(vector_new_fn, &[total.into(), i32_ty.const_int(1, false).into(), buf.into()], "packed_vec")
                     .unwrap().try_as_basic_value().left().unwrap()
             }
+            // ===== Decode helpers =====
+            // antelope.toUint64(bytes, offset), toInt64, toUint32, toUint128, toBytes32
+            Expression::Builtin {
+                kind: kind @ (Builtin::AntelopeToUint64
+                    | Builtin::AntelopeToInt64
+                    | Builtin::AntelopeToUint32
+                    | Builtin::AntelopeToUint128
+                    | Builtin::AntelopeToBytes32),
+                args,
+                ..
+            } => {
+                let i32_ty = bin.context.i32_type();
+                let data = crate::emit::expression::expression(&AntelopeTarget, bin, &args[0], vartab, function);
+                let offset = crate::emit::expression::expression(&AntelopeTarget, bin, &args[1], vartab, function).into_int_value();
+                let data_ptr = bin.vector_bytes(data);
+
+                // GEP to data_ptr + offset
+                let elem_ptr = unsafe {
+                    bin.builder.build_gep(
+                        bin.context.i8_type(),
+                        data_ptr,
+                        &[offset],
+                        "elem_ptr",
+                    ).unwrap()
+                };
+
+                match kind {
+                    Builtin::AntelopeToUint64 | Builtin::AntelopeToInt64 => {
+                        bin.builder.build_load(bin.context.i64_type(), elem_ptr, "decoded").unwrap()
+                    }
+                    Builtin::AntelopeToUint32 => {
+                        bin.builder.build_load(i32_ty, elem_ptr, "decoded").unwrap()
+                    }
+                    Builtin::AntelopeToUint128 => {
+                        bin.builder.build_load(bin.context.custom_width_int_type(128), elem_ptr, "decoded").unwrap()
+                    }
+                    Builtin::AntelopeToBytes32 => {
+                        bin.builder.build_load(bin.context.custom_width_int_type(256), elem_ptr, "decoded").unwrap()
+                    }
+                    _ => unreachable!(),
+                }
+            }
+
+            // antelope.toString(bytes, offset)
+            Expression::Builtin {
+                kind: Builtin::AntelopeToString,
+                args,
+                ..
+            } => {
+                let i32_ty = bin.context.i32_type();
+                let i64_ty = bin.context.i64_type();
+
+                let data = crate::emit::expression::expression(&AntelopeTarget, bin, &args[0], vartab, function);
+                let offset = crate::emit::expression::expression(&AntelopeTarget, bin, &args[1], vartab, function).into_int_value();
+                let data_ptr = bin.vector_bytes(data);
+
+                // Pointer to the varuint32 at offset
+                let varuint_ptr = unsafe {
+                    bin.builder.build_gep(bin.context.i8_type(), data_ptr, &[offset], "varuint_ptr").unwrap()
+                };
+
+                // Decode varuint32: returns packed u64 (low32=value, high32=bytes_read)
+                let decode_fn = bin.module.get_function("__decode_varuint32").unwrap();
+                let packed = bin.builder
+                    .build_call(decode_fn, &[varuint_ptr.into()], "packed")
+                    .unwrap().try_as_basic_value().left().unwrap().into_int_value();
+
+                let str_len_i64 = bin.builder
+                    .build_and(packed, i64_ty.const_int(0xFFFF_FFFF, false), "str_len_64").unwrap();
+                let str_len = bin.builder
+                    .build_int_truncate(str_len_i64, i32_ty, "str_len").unwrap();
+                let bytes_read_i64 = bin.builder
+                    .build_right_shift(packed, i64_ty.const_int(32, false), false, "br_64").unwrap();
+                let bytes_read = bin.builder
+                    .build_int_truncate(bytes_read_i64, i32_ty, "bytes_read").unwrap();
+
+                // String data starts at offset + bytes_read
+                let after_len = bin.builder.build_int_add(offset, bytes_read, "after_len").unwrap();
+                let str_data_ptr = unsafe {
+                    bin.builder.build_gep(bin.context.i8_type(), data_ptr, &[after_len], "str_data").unwrap()
+                };
+
+                // Create a vector (string) from the data
+                let vector_new_fn = bin.module.get_function("vector_new").unwrap();
+                bin.builder
+                    .build_call(vector_new_fn, &[str_len.into(), i32_ty.const_int(1, false).into(), str_data_ptr.into()], "str_vec")
+                    .unwrap().try_as_basic_value().left().unwrap()
+            }
+
+            // ===== Table read builtins =====
+
+            // antelope.dbFind(code, scope, table, pk) -> int32 iterator
+            Expression::Builtin {
+                kind: Builtin::AntelopeDbFind,
+                args,
+                ..
+            } => {
+                let code = crate::emit::expression::expression(&AntelopeTarget, bin, &args[0], vartab, function).into_int_value();
+                let scope = crate::emit::expression::expression(&AntelopeTarget, bin, &args[1], vartab, function).into_int_value();
+                let table = crate::emit::expression::expression(&AntelopeTarget, bin, &args[2], vartab, function).into_int_value();
+                let pk = crate::emit::expression::expression(&AntelopeTarget, bin, &args[3], vartab, function).into_int_value();
+
+                let db_find_fn = bin.module.get_function("db_find_i64").unwrap();
+                bin.builder
+                    .build_call(db_find_fn, &[code.into(), scope.into(), table.into(), pk.into()], "db_find")
+                    .unwrap().try_as_basic_value().left().unwrap()
+            }
+
+            // antelope.dbLowerbound(code, scope, table, id) -> int32 iterator
+            Expression::Builtin {
+                kind: Builtin::AntelopeDbLowerbound,
+                args,
+                ..
+            } => {
+                let code = crate::emit::expression::expression(&AntelopeTarget, bin, &args[0], vartab, function).into_int_value();
+                let scope = crate::emit::expression::expression(&AntelopeTarget, bin, &args[1], vartab, function).into_int_value();
+                let table = crate::emit::expression::expression(&AntelopeTarget, bin, &args[2], vartab, function).into_int_value();
+                let id = crate::emit::expression::expression(&AntelopeTarget, bin, &args[3], vartab, function).into_int_value();
+
+                let db_lb_fn = bin.module.get_function("db_lowerbound_i64").unwrap();
+                bin.builder
+                    .build_call(db_lb_fn, &[code.into(), scope.into(), table.into(), id.into()], "db_lb")
+                    .unwrap().try_as_basic_value().left().unwrap()
+            }
+
+            // antelope.dbGet(iterator) -> bytes
+            Expression::Builtin {
+                kind: Builtin::AntelopeDbGet,
+                args,
+                ..
+            } => {
+                let i32_ty = bin.context.i32_type();
+                let iterator = crate::emit::expression::expression(&AntelopeTarget, bin, &args[0], vartab, function).into_int_value();
+
+                let db_get_fn = bin.module.get_function("db_get_i64").unwrap();
+                let ptr_ty = bin.context.ptr_type(inkwell::AddressSpace::default());
+
+                // First call: get data size (pass null ptr, len 0)
+                let data_size = bin.builder
+                    .build_call(db_get_fn, &[iterator.into(), ptr_ty.const_null().into(), i32_ty.const_zero().into()], "data_size")
+                    .unwrap().try_as_basic_value().left().unwrap().into_int_value();
+
+                // Allocate buffer via __malloc
+                let malloc_fn = bin.module.get_function("__malloc").unwrap();
+                let buf = bin.builder
+                    .build_call(malloc_fn, &[data_size.into()], "buf")
+                    .unwrap().try_as_basic_value().left().unwrap().into_pointer_value();
+
+                // Second call: read data into buffer
+                bin.builder
+                    .build_call(db_get_fn, &[iterator.into(), buf.into(), data_size.into()], "")
+                    .unwrap();
+
+                // Wrap as bytes vector
+                let vector_new_fn = bin.module.get_function("vector_new").unwrap();
+                bin.builder
+                    .build_call(vector_new_fn, &[data_size.into(), i32_ty.const_int(1, false).into(), buf.into()], "row_bytes")
+                    .unwrap().try_as_basic_value().left().unwrap()
+            }
+
+            // antelope.dbNext(iterator) -> int32 new_iterator; caches pk in __last_pk
+            Expression::Builtin {
+                kind: Builtin::AntelopeDbNext,
+                args,
+                ..
+            } => {
+                let i64_ty = bin.context.i64_type();
+                let iterator = crate::emit::expression::expression(&AntelopeTarget, bin, &args[0], vartab, function).into_int_value();
+
+                // Alloca for pk output
+                let pk_out = bin.builder.build_alloca(i64_ty, "pk_out").unwrap();
+
+                let db_next_fn = bin.module.get_function("db_next_i64").unwrap();
+                let next_iter = bin.builder
+                    .build_call(db_next_fn, &[iterator.into(), pk_out.into()], "next_iter")
+                    .unwrap().try_as_basic_value().left().unwrap().into_int_value();
+
+                // Cache pk in __last_pk global
+                let pk_val = bin.builder.build_load(i64_ty, pk_out, "pk_val").unwrap().into_int_value();
+                let last_pk_global = bin.module.get_global("__last_pk").unwrap().as_pointer_value();
+                bin.builder.build_store(last_pk_global, pk_val).unwrap();
+
+                next_iter.into()
+            }
+
+            // antelope.lastPk() -> uint64
+            Expression::Builtin {
+                kind: Builtin::AntelopeLastPk,
+                ..
+            } => {
+                let i64_ty = bin.context.i64_type();
+                let last_pk_global = bin.module.get_global("__last_pk").unwrap().as_pointer_value();
+                bin.builder.build_load(i64_ty, last_pk_global, "last_pk").unwrap()
+            }
+
+            // ===== Secondary index builtins =====
+            // All share the same pattern: compute secondary table name, call host, cache pk
+
+            // antelope.dbIdx64Find(code, scope, table, indexNum, key) -> int32
+            // antelope.dbIdx64Lowerbound(code, scope, table, indexNum, key) -> int32
+            Expression::Builtin {
+                kind: kind @ (Builtin::AntelopeDbIdx64Find | Builtin::AntelopeDbIdx64Lowerbound),
+                args,
+                ..
+            } => {
+                let i64_ty = bin.context.i64_type();
+                let code = crate::emit::expression::expression(&AntelopeTarget, bin, &args[0], vartab, function).into_int_value();
+                let scope = crate::emit::expression::expression(&AntelopeTarget, bin, &args[1], vartab, function).into_int_value();
+                let table = crate::emit::expression::expression(&AntelopeTarget, bin, &args[2], vartab, function).into_int_value();
+                let index_num = crate::emit::expression::expression(&AntelopeTarget, bin, &args[3], vartab, function).into_int_value();
+                let key = crate::emit::expression::expression(&AntelopeTarget, bin, &args[4], vartab, function).into_int_value();
+
+                // Compute secondary table name: (table & 0xFFFFFFFFFFFFFFF0) | (indexNum & 0xF)
+                let mask = i64_ty.const_int(0xFFFFFFFFFFFFFFF0, false);
+                let table_masked = bin.builder.build_and(table, mask, "tbl_masked").unwrap();
+                let idx_mask = i64_ty.const_int(0xF, false);
+                let idx_masked = bin.builder.build_and(index_num, idx_mask, "idx_masked").unwrap();
+                let sec_table = bin.builder.build_or(table_masked, idx_masked, "sec_table").unwrap();
+
+                // Alloca for key and pk output
+                let key_ptr = bin.builder.build_alloca(i64_ty, "sec_key").unwrap();
+                bin.builder.build_store(key_ptr, key).unwrap();
+                let pk_out = bin.builder.build_alloca(i64_ty, "pk_out").unwrap();
+
+                let host_fn_name = match kind {
+                    Builtin::AntelopeDbIdx64Find => "db_idx64_find_secondary",
+                    Builtin::AntelopeDbIdx64Lowerbound => "db_idx64_lowerbound",
+                    _ => unreachable!(),
+                };
+                let host_fn = bin.module.get_function(host_fn_name).unwrap();
+                let iter = bin.builder
+                    .build_call(host_fn, &[code.into(), scope.into(), sec_table.into(), key_ptr.into(), pk_out.into()], "idx64_iter")
+                    .unwrap().try_as_basic_value().left().unwrap().into_int_value();
+
+                // Cache pk
+                let pk_val = bin.builder.build_load(i64_ty, pk_out, "pk_val").unwrap().into_int_value();
+                let last_pk_global = bin.module.get_global("__last_pk").unwrap().as_pointer_value();
+                bin.builder.build_store(last_pk_global, pk_val).unwrap();
+
+                iter.into()
+            }
+
+            // antelope.dbIdx128Find(code, scope, table, indexNum, key) -> int32
+            // antelope.dbIdx128Lowerbound(code, scope, table, indexNum, key) -> int32
+            Expression::Builtin {
+                kind: kind @ (Builtin::AntelopeDbIdx128Find | Builtin::AntelopeDbIdx128Lowerbound),
+                args,
+                ..
+            } => {
+                let i64_ty = bin.context.i64_type();
+                let i128_ty = bin.context.custom_width_int_type(128);
+                let code = crate::emit::expression::expression(&AntelopeTarget, bin, &args[0], vartab, function).into_int_value();
+                let scope = crate::emit::expression::expression(&AntelopeTarget, bin, &args[1], vartab, function).into_int_value();
+                let table = crate::emit::expression::expression(&AntelopeTarget, bin, &args[2], vartab, function).into_int_value();
+                let index_num = crate::emit::expression::expression(&AntelopeTarget, bin, &args[3], vartab, function).into_int_value();
+                let key = crate::emit::expression::expression(&AntelopeTarget, bin, &args[4], vartab, function).into_int_value();
+
+                // Compute secondary table name
+                let mask = i64_ty.const_int(0xFFFFFFFFFFFFFFF0, false);
+                let table_masked = bin.builder.build_and(table, mask, "tbl_masked").unwrap();
+                let idx_mask = i64_ty.const_int(0xF, false);
+                let idx_masked = bin.builder.build_and(index_num, idx_mask, "idx_masked").unwrap();
+                let sec_table = bin.builder.build_or(table_masked, idx_masked, "sec_table").unwrap();
+
+                // Alloca for 128-bit key and pk output
+                let key_ptr = bin.builder.build_alloca(i128_ty, "sec_key128").unwrap();
+                bin.builder.build_store(key_ptr, key).unwrap();
+                let pk_out = bin.builder.build_alloca(i64_ty, "pk_out").unwrap();
+
+                let host_fn_name = match kind {
+                    Builtin::AntelopeDbIdx128Find => "db_idx128_find_secondary",
+                    Builtin::AntelopeDbIdx128Lowerbound => "db_idx128_lowerbound",
+                    _ => unreachable!(),
+                };
+                let host_fn = bin.module.get_function(host_fn_name).unwrap();
+                let iter = bin.builder
+                    .build_call(host_fn, &[code.into(), scope.into(), sec_table.into(), key_ptr.into(), pk_out.into()], "idx128_iter")
+                    .unwrap().try_as_basic_value().left().unwrap().into_int_value();
+
+                // Cache pk
+                let pk_val = bin.builder.build_load(i64_ty, pk_out, "pk_val").unwrap().into_int_value();
+                let last_pk_global = bin.module.get_global("__last_pk").unwrap().as_pointer_value();
+                bin.builder.build_store(last_pk_global, pk_val).unwrap();
+
+                iter.into()
+            }
+
+            // antelope.dbIdx256Find(code, scope, table, indexNum, key) -> int32
+            // antelope.dbIdx256Lowerbound(code, scope, table, indexNum, key) -> int32
+            Expression::Builtin {
+                kind: kind @ (Builtin::AntelopeDbIdx256Find | Builtin::AntelopeDbIdx256Lowerbound),
+                args,
+                ..
+            } => {
+                let i32_ty = bin.context.i32_type();
+                let i64_ty = bin.context.i64_type();
+                let i256_ty = bin.context.custom_width_int_type(256);
+                let code = crate::emit::expression::expression(&AntelopeTarget, bin, &args[0], vartab, function).into_int_value();
+                let scope = crate::emit::expression::expression(&AntelopeTarget, bin, &args[1], vartab, function).into_int_value();
+                let table = crate::emit::expression::expression(&AntelopeTarget, bin, &args[2], vartab, function).into_int_value();
+                let index_num = crate::emit::expression::expression(&AntelopeTarget, bin, &args[3], vartab, function).into_int_value();
+                let key = crate::emit::expression::expression(&AntelopeTarget, bin, &args[4], vartab, function).into_int_value();
+
+                // Compute secondary table name
+                let mask = i64_ty.const_int(0xFFFFFFFFFFFFFFF0, false);
+                let table_masked = bin.builder.build_and(table, mask, "tbl_masked").unwrap();
+                let idx_mask = i64_ty.const_int(0xF, false);
+                let idx_masked = bin.builder.build_and(index_num, idx_mask, "idx_masked").unwrap();
+                let sec_table = bin.builder.build_or(table_masked, idx_masked, "sec_table").unwrap();
+
+                // Alloca for 256-bit key and pk output
+                let key_ptr = bin.builder.build_alloca(i256_ty, "sec_key256").unwrap();
+                bin.builder.build_store(key_ptr, key).unwrap();
+                let pk_out = bin.builder.build_alloca(i64_ty, "pk_out").unwrap();
+
+                let host_fn_name = match kind {
+                    Builtin::AntelopeDbIdx256Find => "db_idx256_find_secondary",
+                    Builtin::AntelopeDbIdx256Lowerbound => "db_idx256_lowerbound",
+                    _ => unreachable!(),
+                };
+                let host_fn = bin.module.get_function(host_fn_name).unwrap();
+                // idx256 host functions take data_len = 2 (number of 128-bit words)
+                let iter = bin.builder
+                    .build_call(host_fn, &[code.into(), scope.into(), sec_table.into(), key_ptr.into(), i32_ty.const_int(2, false).into(), pk_out.into()], "idx256_iter")
+                    .unwrap().try_as_basic_value().left().unwrap().into_int_value();
+
+                // Cache pk
+                let pk_val = bin.builder.build_load(i64_ty, pk_out, "pk_val").unwrap().into_int_value();
+                let last_pk_global = bin.module.get_global("__last_pk").unwrap().as_pointer_value();
+                bin.builder.build_store(last_pk_global, pk_val).unwrap();
+
+                iter.into()
+            }
+
             _ => panic!("antelope: unimplemented builtin expression: {expr:?}"),
         }
     }

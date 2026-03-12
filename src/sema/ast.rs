@@ -1852,6 +1852,26 @@ pub enum Builtin {
     AntelopeHasAuth,
     AntelopeRequireAuth2,
     AntelopeTimestamp,
+    // Decode helpers
+    AntelopeToUint64,
+    AntelopeToInt64,
+    AntelopeToUint32,
+    AntelopeToUint128,
+    AntelopeToBytes32,
+    AntelopeToString,
+    // Table read builtins
+    AntelopeDbFind,
+    AntelopeDbGet,
+    AntelopeDbNext,
+    AntelopeDbLowerbound,
+    AntelopeLastPk,
+    // Secondary index builtins
+    AntelopeDbIdx64Find,
+    AntelopeDbIdx64Lowerbound,
+    AntelopeDbIdx128Find,
+    AntelopeDbIdx128Lowerbound,
+    AntelopeDbIdx256Find,
+    AntelopeDbIdx256Lowerbound,
 }
 
 #[derive(PartialEq, Eq, Clone, Debug)]
