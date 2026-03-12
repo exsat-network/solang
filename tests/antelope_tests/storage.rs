@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::{build_solidity, encode_action_data, ActionParam};
+use crate::{build_solidity, encode_action_data, string_to_name, ActionParam};
 
 #[test]
 fn mapping_store_and_load() {
@@ -167,4 +167,102 @@ fn bool_storage() {
     vm.action("setflag", data);
     vm.action("readflag", vec![]);
     assert_eq!(vm.prints(), "false");
+}
+
+#[test]
+fn checked_arithmetic_overflow_reverts() {
+    let mut vm = build_solidity(
+        r#"
+        contract Test {
+            function add(uint64 a, uint64 b) public {
+                uint64 c = a + b;
+                // If we get here, no overflow
+                if (c > 0) {
+                    print("ok");
+                }
+            }
+        }
+        "#,
+    );
+
+    // Normal addition should succeed
+    let data = encode_action_data(&[ActionParam::U64(10), ActionParam::U64(20)]);
+    vm.action("add", data);
+    assert_eq!(vm.prints(), "ok");
+
+    // Overflow: max_uint64 + 1 should revert
+    let data = encode_action_data(&[ActionParam::U64(u64::MAX), ActionParam::U64(1)]);
+    vm.action_expect_failure("add", data);
+}
+
+#[test]
+fn checked_arithmetic_underflow_reverts() {
+    let mut vm = build_solidity(
+        r#"
+        contract Test {
+            function sub(uint64 a, uint64 b) public {
+                uint64 c = a - b;
+                if (c == 0) {
+                    print("zero");
+                } else {
+                    print("nonzero");
+                }
+            }
+        }
+        "#,
+    );
+
+    // Normal subtraction
+    let data = encode_action_data(&[ActionParam::U64(10), ActionParam::U64(10)]);
+    vm.action("sub", data);
+    assert_eq!(vm.prints(), "zero");
+
+    // Underflow: 5 - 10 should revert
+    let data = encode_action_data(&[ActionParam::U64(5), ActionParam::U64(10)]);
+    vm.action_expect_failure("sub", data);
+}
+
+#[test]
+fn delete_mapping_entry() {
+    let mut vm = build_solidity(
+        r#"
+        contract Test {
+            mapping(uint64 => uint64) public data;
+
+            function store(uint64 key, uint64 val) public {
+                data[key] = val;
+            }
+
+            function remove(uint64 key) public {
+                delete data[key];
+            }
+
+            function load(uint64 key) public {
+                if (data[key] != 0) {
+                    print("found");
+                } else {
+                    print("empty");
+                }
+            }
+        }
+        "#,
+    );
+
+    // Store a value
+    let data = encode_action_data(&[ActionParam::U64(1), ActionParam::U64(42)]);
+    vm.action("store", data);
+
+    // Verify it's there
+    let data = encode_action_data(&[ActionParam::U64(1)]);
+    vm.action("load", data);
+    assert_eq!(vm.prints(), "found");
+
+    // Delete it
+    let data = encode_action_data(&[ActionParam::U64(1)]);
+    vm.action("remove", data);
+
+    // Verify it's gone
+    let data = encode_action_data(&[ActionParam::U64(1)]);
+    vm.action("load", data);
+    assert_eq!(vm.prints(), "empty");
 }

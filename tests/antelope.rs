@@ -585,6 +585,19 @@ impl MockAntelope {
         }
     }
 
+    /// Call as a notification: code != receiver.
+    /// This simulates receiving an inline action from another contract.
+    pub fn notification(&mut self, code: u64, action_name: &str, data: Vec<u8>) {
+        let action_encoded = string_to_name(action_name) as i64;
+        let receiver = self.runtime.receiver as i64;
+        self.runtime.action_data = data;
+        self.runtime.prints.clear();
+        self.runtime.inline_actions.clear();
+        self.runtime.notifications.clear();
+        self.execute_apply(receiver, code as i64, action_encoded)
+            .expect("notification should not trap");
+    }
+
     /// Get the accumulated print output from the last action call.
     pub fn prints(&self) -> &str {
         &self.runtime.prints
