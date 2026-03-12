@@ -1130,7 +1130,8 @@ pub fn expression(
             kind: kind @ (ast::Builtin::AntelopeCall
                 | ast::Builtin::AntelopeCallAuth
                 | ast::Builtin::AntelopeRequireRecipient
-                | ast::Builtin::AntelopeSetPayer),
+                | ast::Builtin::AntelopeSetPayer
+                | ast::Builtin::AntelopeRequireAuth2),
             args,
             ..
         } => {

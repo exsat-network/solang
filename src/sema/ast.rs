@@ -1849,6 +1849,9 @@ pub enum Builtin {
     AntelopeCallAuth,
     AntelopeSetPayer,
     AntelopePack,
+    AntelopeHasAuth,
+    AntelopeRequireAuth2,
+    AntelopeTimestamp,
 }
 
 #[derive(PartialEq, Eq, Clone, Debug)]

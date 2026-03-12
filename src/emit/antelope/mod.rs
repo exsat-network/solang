@@ -239,6 +239,21 @@ impl AntelopeTarget {
         bin.module
             .add_function("require_auth", require_auth_ty, Some(Linkage::External));
 
+        // bool has_auth(uint64_t name) → returns i32 (C bool)
+        let has_auth_ty = i32_ty.fn_type(&[i64_ty.into()], false);
+        bin.module
+            .add_function("has_auth", has_auth_ty, Some(Linkage::External));
+
+        // void require_auth2(uint64_t account, uint64_t permission)
+        let require_auth2_ty = void_ty.fn_type(&[i64_ty.into(), i64_ty.into()], false);
+        bin.module
+            .add_function("require_auth2", require_auth2_ty, Some(Linkage::External));
+
+        // uint64_t current_time()
+        let current_time_ty = i64_ty.fn_type(&[], false);
+        bin.module
+            .add_function("current_time", current_time_ty, Some(Linkage::External));
+
         // uint64_t current_receiver()
         let current_receiver_ty = i64_ty.fn_type(&[], false);
         bin.module.add_function(
@@ -807,26 +822,38 @@ impl AntelopeTarget {
                         } else {
                             // Variable-length type (string/bytes): read varuint32 length, then data.
                             // Antelope DataStream encodes strings as: varuint32 length + raw bytes.
-                            // For simplicity, we support lengths < 128 (single-byte varuint).
-                            // This covers virtually all action parameter strings.
-                            let str_len = bin
+                            // Use __decode_varuint32 to handle lengths >= 128 correctly.
+                            // Returns u64 packed as: low32 = value, high32 = bytes_read.
+                            let decode_fn = bin.module.get_function("__decode_varuint32").unwrap();
+                            let packed = bin
                                 .builder
-                                .build_load(context.i8_type(), param_ptr, "str_len_byte")
+                                .build_call(decode_fn, &[param_ptr.into()], "vdec")
+                                .unwrap()
+                                .try_as_basic_value()
+                                .left()
                                 .unwrap()
                                 .into_int_value();
-                            let str_len_i32 = bin
-                                .builder
-                                .build_int_z_extend(str_len, i32_ty, "str_len")
+
+                            // str_len = low 32 bits
+                            let str_len_i64 = bin.builder
+                                .build_and(packed, i64_ty.const_int(0xFFFF_FFFF, false), "sl64")
+                                .unwrap();
+                            let str_len_i32 = bin.builder
+                                .build_int_truncate(str_len_i64, i32_ty, "str_len")
                                 .unwrap();
 
-                            // Advance past the varuint32 length byte.
+                            // bytes_read = high 32 bits
+                            let bytes_read_i64 = bin.builder
+                                .build_right_shift(packed, i64_ty.const_int(32, false), false, "br64")
+                                .unwrap();
+                            let bytes_read = bin.builder
+                                .build_int_truncate(bytes_read_i64, i32_ty, "bytes_read")
+                                .unwrap();
+
+                            // Advance past the varuint32 header.
                             let after_len = bin
                                 .builder
-                                .build_int_add(
-                                    cur_offset,
-                                    i32_ty.const_int(1, false),
-                                    "after_len",
-                                )
+                                .build_int_add(cur_offset, bytes_read, "after_len")
                                 .unwrap();
 
                             let str_data_ptr = unsafe {
@@ -861,7 +888,7 @@ impl AntelopeTarget {
 
                             args.push(vec_ptr.into());
 
-                            // Advance offset past length byte + string data.
+                            // Advance offset past varuint32 header + string data.
                             let new_offset = bin
                                 .builder
                                 .build_int_add(after_len, str_len_i32, "new_off")

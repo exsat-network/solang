@@ -36,7 +36,7 @@ pub struct Prototype {
 }
 
 // A list of all Solidity builtins functions
-pub static BUILTIN_FUNCTIONS: Lazy<[Prototype; 38]> = Lazy::new(|| { // 29 original + 9 Antelope
+pub static BUILTIN_FUNCTIONS: Lazy<[Prototype; 41]> = Lazy::new(|| { // 29 original + 12 Antelope
     [
         Prototype {
             builtin: Builtin::ExtendInstanceTtl,
@@ -466,6 +466,39 @@ pub static BUILTIN_FUNCTIONS: Lazy<[Prototype; 38]> = Lazy::new(|| { // 29 origi
             ret: vec![Type::DynamicBytes],
             target: vec![Target::Antelope],
             doc: "Pack arguments into Antelope CDT format (little-endian integers, varuint32-prefixed strings). Variadic: accepts any number of typed arguments.",
+            constant: false,
+        },
+        Prototype {
+            builtin: Builtin::AntelopeHasAuth,
+            namespace: Some("antelope"),
+            method: vec![],
+            name: "hasAuth",
+            params: vec![Type::Uint(64)],
+            ret: vec![Type::Bool],
+            target: vec![Target::Antelope],
+            doc: "Returns true if the transaction includes authorization for the given Antelope account. Does not abort on failure.",
+            constant: false,
+        },
+        Prototype {
+            builtin: Builtin::AntelopeRequireAuth2,
+            namespace: Some("antelope"),
+            method: vec![],
+            name: "requireAuth2",
+            params: vec![Type::Uint(64), Type::Uint(64)],
+            ret: vec![],
+            target: vec![Target::Antelope],
+            doc: "Require explicit permission-level authorization. Args: account (uint64), permission (uint64, e.g. antelope.name(\"active\")).",
+            constant: false,
+        },
+        Prototype {
+            builtin: Builtin::AntelopeTimestamp,
+            namespace: Some("antelope"),
+            method: vec![],
+            name: "timestamp",
+            params: vec![],
+            ret: vec![Type::Uint(64)],
+            target: vec![Target::Antelope],
+            doc: "Returns the current block time as microseconds since Unix epoch (current_time() host function).",
             constant: false,
         },
     ]

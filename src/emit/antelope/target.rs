@@ -1431,6 +1431,61 @@ impl<'a> TargetRuntime<'a> for AntelopeTarget {
                 bin.context.i64_type().const_zero().into()
             }
             Expression::Builtin {
+                kind: Builtin::AntelopeHasAuth,
+                args,
+                ..
+            } => {
+                let account = crate::emit::expression::expression(
+                    &AntelopeTarget, bin, &args[0], vartab, function,
+                ).into_int_value();
+
+                let has_auth_fn = bin.module.get_function("has_auth").unwrap();
+                let result = bin.builder
+                    .build_call(has_auth_fn, &[account.into()], "has_auth_result")
+                    .unwrap()
+                    .try_as_basic_value()
+                    .left()
+                    .unwrap()
+                    .into_int_value();
+
+                // has_auth returns i32 (C bool); truncate to i1 for Solidity bool.
+                bin.builder
+                    .build_int_truncate(result, bin.context.bool_type(), "has_auth_bool")
+                    .unwrap()
+                    .into()
+            }
+            Expression::Builtin {
+                kind: Builtin::AntelopeRequireAuth2,
+                args,
+                ..
+            } => {
+                let account = crate::emit::expression::expression(
+                    &AntelopeTarget, bin, &args[0], vartab, function,
+                ).into_int_value();
+                let permission = crate::emit::expression::expression(
+                    &AntelopeTarget, bin, &args[1], vartab, function,
+                ).into_int_value();
+
+                let require_auth2_fn = bin.module.get_function("require_auth2").unwrap();
+                bin.builder
+                    .build_call(require_auth2_fn, &[account.into(), permission.into()], "")
+                    .unwrap();
+
+                bin.context.i64_type().const_zero().into()
+            }
+            Expression::Builtin {
+                kind: Builtin::AntelopeTimestamp,
+                ..
+            } => {
+                let current_time_fn = bin.module.get_function("current_time").unwrap();
+                bin.builder
+                    .build_call(current_time_fn, &[], "timestamp")
+                    .unwrap()
+                    .try_as_basic_value()
+                    .left()
+                    .unwrap()
+            }
+            Expression::Builtin {
                 kind: Builtin::AntelopePack,
                 args,
                 ..

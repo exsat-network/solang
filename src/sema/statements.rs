@@ -1327,6 +1327,7 @@ fn emit_event(
                 event.used = true;
 
                 diagnostics.extend(candidate_diagnostics);
+                antelope_check_event_name(event_no, loc, ns, diagnostics);
 
                 return Ok(stmt);
             } else {
@@ -1506,6 +1507,8 @@ fn emit_event(
                 let event = &mut ns.events[event_no];
                 event.used = true;
 
+                antelope_check_event_name(event_no, loc, ns, diagnostics);
+
                 return Ok(stmt);
             } else {
                 diagnostics.push(Diagnostic::error_with_notes(
@@ -1537,6 +1540,41 @@ fn emit_event(
     }
 
     Err(())
+}
+
+/// For the Antelope target: warn if an event name will be silently truncated.
+/// Antelope action names are max 12 chars (lowercase + digits + dot).
+/// We prefix with "e." (2 chars), leaving 10 chars for the filtered event name.
+fn antelope_check_event_name(
+    event_no: usize,
+    loc: &pt::Loc,
+    ns: &Namespace,
+    diagnostics: &mut Diagnostics,
+) {
+    if ns.target != crate::Target::Antelope {
+        return;
+    }
+    let event_name = &ns.events[event_no].id.name;
+    let filtered_len: usize = event_name
+        .chars()
+        .filter(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+        .count();
+    if filtered_len > 10 {
+        let truncated: String = event_name
+            .to_lowercase()
+            .chars()
+            .filter(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+            .take(10)
+            .collect();
+        diagnostics.push(Diagnostic::warning(
+            *loc,
+            format!(
+                "event name '{}' has {} valid characters after filtering but only 10 fit; \
+                 action name will be 'e.{}'",
+                event_name, filtered_len, truncated
+            ),
+        ));
+    }
 }
 
 fn remove_duplicate_events(
