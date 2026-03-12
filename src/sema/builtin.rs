@@ -36,7 +36,7 @@ pub struct Prototype {
 }
 
 // A list of all Solidity builtins functions
-pub static BUILTIN_FUNCTIONS: Lazy<[Prototype; 37]> = Lazy::new(|| { // 29 original + 8 Antelope
+pub static BUILTIN_FUNCTIONS: Lazy<[Prototype; 38]> = Lazy::new(|| { // 29 original + 9 Antelope
     [
         Prototype {
             builtin: Builtin::ExtendInstanceTtl,
@@ -455,6 +455,17 @@ pub static BUILTIN_FUNCTIONS: Lazy<[Prototype; 37]> = Lazy::new(|| { // 29 origi
             ret: vec![],
             target: vec![Target::Antelope],
             doc: "Set the RAM payer for subsequent storage operations. Defaults to self if not called.",
+            constant: false,
+        },
+        Prototype {
+            builtin: Builtin::AntelopePack,
+            namespace: Some("antelope"),
+            method: vec![],
+            name: "pack",
+            params: vec![],
+            ret: vec![Type::DynamicBytes],
+            target: vec![Target::Antelope],
+            doc: "Pack arguments into Antelope CDT format (little-endian integers, varuint32-prefixed strings). Variadic: accepts any number of typed arguments.",
             constant: false,
         },
     ]
@@ -1241,6 +1252,36 @@ pub(super) fn resolve_namespace_call(
             loc: *loc,
             tys: Vec::new(),
             kind: Builtin::AuthAsCurrContract,
+            args: resolved_args,
+        });
+    }
+
+    // antelope.pack(...) is variadic — resolve all args with unknown type
+    if namespace == "antelope" && name == "pack" {
+        let mut resolved_args = Vec::new();
+        for arg in args {
+            let mut expr = expression(arg, context, ns, symtable, diagnostics, ResolveTo::Unknown)?;
+            // Byte/string literals come through as BytesLiteral{ty:Bytes(0)} — cast to String
+            // so the emit layer sees Type::String, not a 0-bit integer.
+            if let Expression::BytesLiteral { .. } = &expr {
+                expr = expr.cast(&arg.loc(), &Type::String, true, ns, diagnostics)?;
+            }
+            // StorageRef args (state variables) need an explicit load, since
+            // ResolveTo::Unknown doesn't trigger the implicit dereference.
+            if let Type::StorageRef(_, inner_ty) = expr.ty() {
+                expr = Expression::StorageLoad {
+                    loc: arg.loc(),
+                    ty: *inner_ty,
+                    expr: Box::new(expr),
+                };
+            }
+            resolved_args.push(expr);
+
+        }
+        return Ok(Expression::Builtin {
+            loc: *loc,
+            tys: vec![Type::DynamicBytes],
+            kind: Builtin::AntelopePack,
             args: resolved_args,
         });
     }

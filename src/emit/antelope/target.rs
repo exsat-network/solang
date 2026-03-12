@@ -8,7 +8,7 @@ use crate::emit::ContractArgs;
 use crate::emit::{TargetRuntime, Variable};
 use crate::sema::ast;
 use crate::sema::ast::CallTy;
-use crate::sema::ast::{Function, Type};
+use crate::sema::ast::{Function, RetrieveType, Type};
 
 use inkwell::types::{BasicTypeEnum, IntType};
 use inkwell::values::{
@@ -1429,6 +1429,156 @@ impl<'a> TargetRuntime<'a> for AntelopeTarget {
                     .unwrap();
 
                 bin.context.i64_type().const_zero().into()
+            }
+            Expression::Builtin {
+                kind: Builtin::AntelopePack,
+                args,
+                ..
+            } => {
+                // antelope.pack(arg0, arg1, ...) → bytes memory
+                // Serialises each argument in Antelope CDT little-endian format:
+                //   integers  → N bytes stored directly (WASM is LE, so store is already LE)
+                //   bool      → 1 byte (0 or 1)
+                //   string/bytes → varuint32(len) + raw bytes
+                //
+                // Steps: evaluate all args, compute total byte count, malloc,
+                // write each arg, return as a bytes vector.
+
+                let i8_ty  = bin.context.i8_type();
+                let i32_ty = bin.context.i32_type();
+
+                let encode_fn = bin.module.get_function("__encode_varuint32").unwrap();
+                let malloc_fn = bin.module.get_function("__malloc").unwrap();
+                let vector_new_fn = bin.module.get_function("vector_new").unwrap();
+
+                // Peel through ZeroExt/SignExt wrappers to get the declared type.
+                // Storage-loaded variables are widened to Uint(256) by codegen, but
+                // for packing we want the original declared type (e.g. Uint(64)).
+                fn peel_type(e: &crate::codegen::Expression) -> crate::sema::ast::Type {
+                    match e {
+                        crate::codegen::Expression::ZeroExt { expr, .. }
+                        | crate::codegen::Expression::SignExt { expr, .. } => peel_type(expr),
+                        other => other.ty(),
+                    }
+                }
+
+                // Evaluate all args once and pair with their declared (peeled) types.
+                let arg_vals: Vec<(crate::sema::ast::Type, inkwell::values::BasicValueEnum)> = args
+                    .iter()
+                    .map(|a| {
+                        let ty = peel_type(a);
+                        let val = crate::emit::expression::expression(
+                            &AntelopeTarget, bin, a, vartab, function,
+                        );
+                        (ty, val)
+                    })
+                    .collect();
+
+                // Pass 1: compute total packed byte count.
+                let mut total = i32_ty.const_int(0, false);
+                for (ty, val) in &arg_vals {
+                    let fixed: Option<u64> = match ty {
+                        crate::sema::ast::Type::Bool
+                        | crate::sema::ast::Type::Int(8)
+                        | crate::sema::ast::Type::Uint(8) => Some(1),
+                        crate::sema::ast::Type::Int(16) | crate::sema::ast::Type::Uint(16) => Some(2),
+                        crate::sema::ast::Type::Int(32) | crate::sema::ast::Type::Uint(32) => Some(4),
+                        crate::sema::ast::Type::Int(64) | crate::sema::ast::Type::Uint(64) => Some(8),
+                        crate::sema::ast::Type::Int(128) | crate::sema::ast::Type::Uint(128) => Some(16),
+                        crate::sema::ast::Type::Int(256) | crate::sema::ast::Type::Uint(256) => Some(32),
+                        crate::sema::ast::Type::Address(_) => Some(20),
+                        crate::sema::ast::Type::String | crate::sema::ast::Type::DynamicBytes => None,
+                        other => panic!("antelope.pack: unsupported type {:?}", other),
+                    };
+                    if let Some(n) = fixed {
+                        total = bin.builder.build_int_add(total, i32_ty.const_int(n, false), "").unwrap();
+                    } else {
+                        // string/bytes: varuint32(len) + len bytes
+                        let data_len = bin.vector_len(*val);
+                        let scratch = bin.builder.build_array_alloca(i8_ty, i32_ty.const_int(5, false), "vi_sc").unwrap();
+                        let vi_sz = bin.builder
+                            .build_call(encode_fn, &[scratch.into(), data_len.into()], "vi_sz")
+                            .unwrap().try_as_basic_value().left().unwrap().into_int_value();
+                        total = bin.builder.build_int_add(total, vi_sz, "").unwrap();
+                        total = bin.builder.build_int_add(total, data_len, "").unwrap();
+                    }
+                }
+
+                // Allocate output buffer.
+                let buf = bin.builder
+                    .build_call(malloc_fn, &[total.into()], "pack_buf")
+                    .unwrap().try_as_basic_value().left().unwrap().into_pointer_value();
+
+                // Pass 2: write each arg into buf.
+                let mut offset = i32_ty.const_int(0, false);
+                for (ty, val) in &arg_vals {
+                    macro_rules! write_int {
+                        ($nbytes:expr) => {{
+                            let ptr = unsafe {
+                                bin.builder.build_gep(i8_ty, buf, &[offset], "iptr").unwrap()
+                            };
+                            let int_val = val.into_int_value();
+                            let target_bits = ($nbytes as u32) * 8;
+                            let actual_bits = int_val.get_type().get_bit_width();
+                            if actual_bits > target_bits {
+                                let trunc = bin.builder.build_int_truncate(
+                                    int_val,
+                                    bin.context.custom_width_int_type(target_bits),
+                                    "pack_trunc",
+                                ).unwrap();
+                                bin.builder.build_store(ptr, trunc).unwrap();
+                            } else {
+                                bin.builder.build_store(ptr, int_val).unwrap();
+                            };
+                            offset = bin.builder.build_int_add(
+                                offset, i32_ty.const_int($nbytes, false), ""
+                            ).unwrap();
+                        }};
+                    }
+                    match ty {
+                        crate::sema::ast::Type::Bool => {
+                            let byte_val = bin.builder
+                                .build_int_z_extend((*val).into_int_value(), i8_ty, "boolbyte")
+                                .unwrap();
+                            let ptr = unsafe {
+                                bin.builder.build_gep(i8_ty, buf, &[offset], "bptr").unwrap()
+                            };
+                            bin.builder.build_store(ptr, byte_val).unwrap();
+                            offset = bin.builder.build_int_add(offset, i32_ty.const_int(1, false), "").unwrap();
+                        }
+                        crate::sema::ast::Type::Int(8) | crate::sema::ast::Type::Uint(8) => write_int!(1),
+                        crate::sema::ast::Type::Int(16) | crate::sema::ast::Type::Uint(16) => write_int!(2),
+                        crate::sema::ast::Type::Int(32) | crate::sema::ast::Type::Uint(32) => write_int!(4),
+                        crate::sema::ast::Type::Int(64) | crate::sema::ast::Type::Uint(64) => write_int!(8),
+                        crate::sema::ast::Type::Int(128) | crate::sema::ast::Type::Uint(128) => write_int!(16),
+                        crate::sema::ast::Type::Int(256) | crate::sema::ast::Type::Uint(256) => write_int!(32),
+                        crate::sema::ast::Type::Address(_) => write_int!(20),
+                        crate::sema::ast::Type::String | crate::sema::ast::Type::DynamicBytes => {
+                            // Write varuint32(len) then copy bytes.
+                            let data_len = bin.vector_len(*val);
+                            let data_ptr = bin.vector_bytes(*val);
+                            let vi_dst = unsafe {
+                                bin.builder.build_gep(i8_ty, buf, &[offset], "vidst").unwrap()
+                            };
+                            let vi_sz = bin.builder
+                                .build_call(encode_fn, &[vi_dst.into(), data_len.into()], "vi_sz2")
+                                .unwrap().try_as_basic_value().left().unwrap().into_int_value();
+                            let data_off = bin.builder.build_int_add(offset, vi_sz, "").unwrap();
+                            let data_dst = unsafe {
+                                bin.builder.build_gep(i8_ty, buf, &[data_off], "ddst").unwrap()
+                            };
+                            bin.builder.build_memcpy(data_dst, 1, data_ptr, 1, data_len).unwrap();
+                            let field_total = bin.builder.build_int_add(vi_sz, data_len, "").unwrap();
+                            offset = bin.builder.build_int_add(offset, field_total, "").unwrap();
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+
+                // Return as bytes vector: vector_new(total, 1, buf).
+                bin.builder
+                    .build_call(vector_new_fn, &[total.into(), i32_ty.const_int(1, false).into(), buf.into()], "packed_vec")
+                    .unwrap().try_as_basic_value().left().unwrap()
             }
             _ => panic!("antelope: unimplemented builtin expression: {expr:?}"),
         }

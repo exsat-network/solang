@@ -1876,6 +1876,7 @@ pub enum Builtin {
     AntelopeCall,
     AntelopeCallAuth,
     AntelopeSetPayer,
+    AntelopePack,
 }
 
 impl From<&ast::Builtin> for Builtin {
@@ -1950,6 +1951,7 @@ impl From<&ast::Builtin> for Builtin {
             ast::Builtin::AntelopeCall => Builtin::AntelopeCall,
             ast::Builtin::AntelopeCallAuth => Builtin::AntelopeCallAuth,
             ast::Builtin::AntelopeSetPayer => Builtin::AntelopeSetPayer,
+            ast::Builtin::AntelopePack => Builtin::AntelopePack,
             _ => panic!("Builtin should not be in the cfg"),
         }
     }

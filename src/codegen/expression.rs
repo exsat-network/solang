@@ -1123,6 +1123,37 @@ pub fn expression(
             );
             Expression::Poison
         }
+        // Void side-effect builtins: must be wrapped in Instr::Set so LLVM emits them.
+        // Pattern: dummy Uint(64) return type, temp variable discarded, returns Poison.
+        ast::Expression::Builtin {
+            loc,
+            kind: kind @ (ast::Builtin::AntelopeCall
+                | ast::Builtin::AntelopeCallAuth
+                | ast::Builtin::AntelopeRequireRecipient
+                | ast::Builtin::AntelopeSetPayer),
+            args,
+            ..
+        } => {
+            let lowered_args: Vec<Expression> = args
+                .iter()
+                .map(|a| expression(a, cfg, contract_no, func, ns, vartab, opt))
+                .collect();
+            let res = vartab.temp_anonymous(&Type::Uint(64));
+            cfg.add(
+                vartab,
+                Instr::Set {
+                    loc: *loc,
+                    res,
+                    expr: Expression::Builtin {
+                        loc: *loc,
+                        tys: vec![Type::Uint(64)],
+                        kind: kind.into(),
+                        args: lowered_args,
+                    },
+                },
+            );
+            Expression::Poison
+        }
         ast::Expression::Builtin {
             loc,
             tys,
