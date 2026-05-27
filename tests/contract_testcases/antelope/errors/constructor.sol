@@ -14,4 +14,3 @@ contract WithConstructor {
 }
 // ---- Expect: diagnostics ----
 // error: 7:5-19: constructors are not supported on Antelope. Use an explicit init() action instead.
-// warning: 11:5-48: return values on public functions are ignored on Antelope. Use state variables or events to communicate results.

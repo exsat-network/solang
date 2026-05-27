@@ -18,4 +18,3 @@ contract MappingTest {
 }
 // ---- Expect: diagnostics ----
 // warning: 11:5-54: function can be declared 'view'
-// warning: 11:5-54: return values on public functions are ignored on Antelope. Use state variables or events to communicate results.

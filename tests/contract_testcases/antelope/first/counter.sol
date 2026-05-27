@@ -18,4 +18,3 @@ contract Counter {
 }
 // ---- Expect: diagnostics ----
 // warning: 15:5-48: function can be declared 'view'
-// warning: 15:5-48: return values on public functions are ignored on Antelope. Use state variables or events to communicate results.

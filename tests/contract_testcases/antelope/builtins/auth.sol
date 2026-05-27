@@ -17,5 +17,4 @@ contract AuthTest {
 // ---- Expect: diagnostics ----
 // warning: 5:5-43: function can be declared 'pure'
 // warning: 9:5-61: function can be declared 'pure'
-// warning: 9:5-61: return values on public functions are ignored on Antelope. Use state variables or events to communicate results.
 // warning: 13:5-63: function can be declared 'pure'

@@ -274,6 +274,14 @@ impl Runtime {
         Ok(())
     }
 
+    // --- Return value ---
+
+    #[host("env")]
+    fn set_action_return_value(_ptr: u32, _len: u32) -> Result<(), Trap> {
+        // In a real environment this captures the return value; mock ignores it.
+        Ok(())
+    }
+
     // --- Crypto ---
 
     #[host("env")]

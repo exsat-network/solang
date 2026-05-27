@@ -39,9 +39,5 @@ contract TableAccessTest {
 }
 // ---- Expect: diagnostics ----
 // warning: 5:5-83: function can be declared 'pure'
-// warning: 5:5-83: return values on public functions are ignored on Antelope. Use state variables or events to communicate results.
 // warning: 17:5-88: function can be declared 'pure'
-// warning: 17:5-88: return values on public functions are ignored on Antelope. Use state variables or events to communicate results.
 // warning: 27:5-119: function can be declared 'pure'
-// warning: 27:5-119: return values on public functions are ignored on Antelope. Use state variables or events to communicate results.
-// warning: 33:5-94: return values on public functions are ignored on Antelope. Use state variables or events to communicate results.
