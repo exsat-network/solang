@@ -149,6 +149,10 @@ fn solidity_type_to_antelope(ty: &Type, _ns: &Namespace) -> String {
         Type::Int(128) => "int128".to_string(),
         Type::Bool => "bool".to_string(),
         Type::String => "string".to_string(),
+        // A 32-byte value (e.g. a sha256/keccak hash) is a fixed 32 raw bytes with
+        // no length prefix — that is exactly `checksum256`. Mapping it to `bytes`
+        // (which carries a varuint32 length prefix) would misalign action data.
+        Type::Bytes(32) => "checksum256".to_string(),
         Type::Address(_) => "uint64".to_string(),
         _ => "bytes".to_string(),
     }

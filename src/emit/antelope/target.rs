@@ -18,7 +18,6 @@ use inkwell::IntPredicate;
 
 use solang_parser::pt::{Loc, StorageType};
 
-use num_bigint::BigInt;
 use num_traits::{ToPrimitive, Zero};
 use std::collections::HashMap;
 
@@ -99,180 +98,47 @@ impl<'a> TargetRuntime<'a> for AntelopeTarget {
         }
 
         let i32_ty = bin.context.i32_type();
-        let i64_ty = bin.context.i64_type();
         let i256_ty = bin.context.custom_width_int_type(256);
 
         let bits = ty.bits(bin.ns) as u32;
         let byte_size = (bits + 7) / 8;
+        let val_ty = bin.context.custom_width_int_type(bits);
 
-        // Load receiver from global.
-        let receiver_global = AntelopeTarget::get_receiver_global(bin);
-        let receiver = bin
-            .builder
-            .build_load(i64_ty, receiver_global.as_pointer_value(), "receiver")
-            .unwrap()
-            .into_int_value();
-
-        let table_name = i64_ty.const_int(STATE_TABLE_NAME, false);
-
-        // Convert slot to 256-bit value and store to stack buffer.
+        // Convert slot to a 256-bit value for the shared helper.
         let slot_i256 = if slot.get_type().get_bit_width() == 256 {
             *slot
         } else if slot.get_type().get_bit_width() > 256 {
-            bin.builder
-                .build_int_truncate(*slot, i256_ty, "slot256")
-                .unwrap()
+            bin.builder.build_int_truncate(*slot, i256_ty, "slot256").unwrap()
         } else {
-            bin.builder
-                .build_int_z_extend(*slot, i256_ty, "slot256")
-                .unwrap()
+            bin.builder.build_int_z_extend(*slot, i256_ty, "slot256").unwrap()
         };
 
-        let slot_buf = bin
+        // Pre-zero the value buffer so an unset slot reads as 0, then let the shared
+        // helper overwrite it on a hit. Collapses the inline find/get sequence to a call.
+        let buf = bin
             .builder
             .build_array_alloca(
                 bin.context.i8_type(),
-                i32_ty.const_int(32, false),
-                "slot_buf",
+                i32_ty.const_int(byte_size as u64, false),
+                "load_buf",
             )
             .unwrap();
-        bin.builder.build_store(slot_buf, slot_i256).unwrap();
+        bin.builder.build_store(buf, val_ty.const_zero()).unwrap();
 
-        // Allocate output for primary key.
-        let pk_out = bin.builder.build_alloca(i64_ty, "pk_out").unwrap();
-
-        // Look up via idx256 secondary index.
-        let db_idx256_find = bin
-            .module
-            .get_function("db_idx256_find_secondary")
-            .unwrap();
-        let data_len = i32_ty.const_int(2, false); // 2 x uint128_t = 256 bits
-        let sec_iter = bin
-            .builder
-            .build_call(
-                db_idx256_find,
-                &[
-                    receiver.into(),
-                    receiver.into(),
-                    table_name.into(),
-                    slot_buf.into(),
-                    data_len.into(),
-                    pk_out.into(),
-                ],
-                "sec_iter",
-            )
-            .unwrap()
-            .try_as_basic_value()
-            .left()
-            .unwrap()
-            .into_int_value();
-
-        // Check if found (iter >= 0).
-        let found = bin
-            .builder
-            .build_int_compare(
-                IntPredicate::SGE,
-                sec_iter,
-                i32_ty.const_zero(),
-                "found",
-            )
-            .unwrap();
-
-        let found_bb = bin.context.append_basic_block(function, "idx_found");
-        let notfound_bb = bin.context.append_basic_block(function, "idx_notfound");
-        let merge_bb = bin.context.append_basic_block(function, "idx_merge");
-
-        bin.builder
-            .build_conditional_branch(found, found_bb, notfound_bb)
-            .unwrap();
-
-        // FOUND: look up primary row by pk, then read value.
-        bin.builder.position_at_end(found_bb);
-
-        let val_ty = bin.context.custom_width_int_type(bits);
-        let pk = bin
-            .builder
-            .build_load(i64_ty, pk_out, "pk")
-            .unwrap()
-            .into_int_value();
-
-        // Find primary row by pk.
-        let db_find = bin.module.get_function("db_find_i64").unwrap();
-        let pri_iter = bin
-            .builder
-            .build_call(
-                db_find,
-                &[
-                    receiver.into(),
-                    receiver.into(),
-                    table_name.into(),
-                    pk.into(),
-                ],
-                "pri_iter",
-            )
-            .unwrap()
-            .try_as_basic_value()
-            .left()
-            .unwrap()
-            .into_int_value();
-
-        // Read row data: [pk: u64, slot_hash: checksum256, varuint32(len), value: N bytes].
-        let row_size = 8 + 32 + 1 + byte_size; // pk(8) + hash(32) + varuint(1) + value(N)
-        let row_buf = bin
-            .builder
-            .build_array_alloca(
-                bin.context.i8_type(),
-                i32_ty.const_int(row_size as u64, false),
-                "row_buf",
-            )
-            .unwrap();
-
-        let db_get = bin.module.get_function("db_get_i64").unwrap();
+        let helper = bin.module.get_function("__antelope_load_slot").unwrap();
         bin.builder
             .build_call(
-                db_get,
+                helper,
                 &[
-                    pri_iter.into(),
-                    row_buf.into(),
-                    i32_ty.const_int(row_size as u64, false).into(),
+                    slot_i256.into(),
+                    buf.into(),
+                    i32_ty.const_int(byte_size as u64, false).into(),
                 ],
                 "",
             )
             .unwrap();
 
-        // Value starts at offset 41 (after pk + slot_hash + varuint32 length byte).
-        let val_ptr = unsafe {
-            bin.builder
-                .build_gep(
-                    bin.context.i8_type(),
-                    row_buf,
-                    &[i32_ty.const_int(41, false)],
-                    "val_ptr",
-                )
-                .unwrap()
-        };
-
-        let loaded_val = bin
-            .builder
-            .build_load(val_ty, val_ptr, "loaded")
-            .unwrap()
-            .into_int_value();
-        bin.builder.build_unconditional_branch(merge_bb).unwrap();
-
-        // NOT FOUND: return zero.
-        bin.builder.position_at_end(notfound_bb);
-        let zero_val = val_ty.const_zero();
-        bin.builder.build_unconditional_branch(merge_bb).unwrap();
-
-        // MERGE with phi.
-        bin.builder.position_at_end(merge_bb);
-        let phi = bin
-            .builder
-            .build_phi(val_ty, "storage_val")
-            .unwrap();
-        phi.add_incoming(&[(&loaded_val, found_bb), (&zero_val, notfound_bb)]);
-
-        phi.as_basic_value()
+        bin.builder.build_load(val_ty, buf, "storage_val").unwrap()
     }
 
     /// Store a value to Antelope table storage via idx256 secondary index.
@@ -353,366 +219,54 @@ impl<'a> TargetRuntime<'a> for AntelopeTarget {
         }
 
         let i32_ty = bin.context.i32_type();
-        let i64_ty = bin.context.i64_type();
         let i256_ty = bin.context.custom_width_int_type(256);
 
         let bits = ty.bits(bin.ns) as u32;
         let byte_size = (bits + 7) / 8;
+        let val_ty = bin.context.custom_width_int_type(bits);
+        assert!(byte_size <= 127, "fixed-size value too large for 1-byte varuint32");
 
-        // Load receiver.
-        let receiver_global = AntelopeTarget::get_receiver_global(bin);
-        let receiver = bin
-            .builder
-            .build_load(i64_ty, receiver_global.as_pointer_value(), "receiver")
-            .unwrap()
-            .into_int_value();
-        let ram_payer = AntelopeTarget::get_ram_payer(bin);
-
-        let table_name = i64_ty.const_int(STATE_TABLE_NAME, false);
-
-        // Convert slot to 256-bit value and store to stack buffer.
+        // Convert slot to a 256-bit value for the shared helper.
         let slot_i256 = if slot.get_type().get_bit_width() == 256 {
             *slot
         } else if slot.get_type().get_bit_width() > 256 {
-            bin.builder
-                .build_int_truncate(*slot, i256_ty, "slot256")
-                .unwrap()
+            bin.builder.build_int_truncate(*slot, i256_ty, "slot256").unwrap()
         } else {
-            bin.builder
-                .build_int_z_extend(*slot, i256_ty, "slot256")
-                .unwrap()
+            bin.builder.build_int_z_extend(*slot, i256_ty, "slot256").unwrap()
         };
 
-        let slot_buf = bin
-            .builder
-            .build_array_alloca(
-                bin.context.i8_type(),
-                i32_ty.const_int(32, false),
-                "slot_buf",
-            )
-            .unwrap();
-        bin.builder.build_store(slot_buf, slot_i256).unwrap();
-
-        // Row format: [pk: u64, slot_hash: checksum256, varuint32(value_len), value: N bytes].
-        // For fixed-size values (≤32 bytes), varuint32 is 1 byte.
-        let val_ty = bin.context.custom_width_int_type(bits);
-        assert!(byte_size <= 127, "fixed-size value too large for 1-byte varuint32");
-        let row_size = 8 + 32 + 1 + byte_size; // pk(8) + hash(32) + varuint(1) + value(N)
-        let row_buf = bin
-            .builder
-            .build_array_alloca(
-                bin.context.i8_type(),
-                i32_ty.const_int(row_size as u64, false),
-                "row_buf",
-            )
-            .unwrap();
-
-        // Write slot_hash at offset 8.
-        let hash_ptr = unsafe {
-            bin.builder
-                .build_gep(
-                    bin.context.i8_type(),
-                    row_buf,
-                    &[i32_ty.const_int(8, false)],
-                    "hash_ptr",
-                )
-                .unwrap()
-        };
-        bin.builder.build_store(hash_ptr, slot_i256).unwrap();
-
-        // Write varuint32 length at offset 40.
-        let len_ptr = unsafe {
-            bin.builder
-                .build_gep(
-                    bin.context.i8_type(),
-                    row_buf,
-                    &[i32_ty.const_int(40, false)],
-                    "len_ptr",
-                )
-                .unwrap()
-        };
-        bin.builder
-            .build_store(len_ptr, bin.context.i8_type().const_int(byte_size as u64, false))
-            .unwrap();
-
-        // Write value at offset 41 (8 + 32 + 1).
-        let val_ptr = unsafe {
-            bin.builder
-                .build_gep(
-                    bin.context.i8_type(),
-                    row_buf,
-                    &[i32_ty.const_int(41, false)],
-                    "val_ptr",
-                )
-                .unwrap()
-        };
-
+        // Materialize the value into a little-endian byte buffer, then hand off to the
+        // shared helper, which does the find + update-or-insert row write.
         let dest_int = dest.into_int_value();
         let store_val = if dest_int.get_type().get_bit_width() == bits {
             dest_int
         } else if dest_int.get_type().get_bit_width() > bits {
-            bin.builder
-                .build_int_truncate(dest_int, val_ty, "trunc")
-                .unwrap()
+            bin.builder.build_int_truncate(dest_int, val_ty, "trunc").unwrap()
         } else {
-            bin.builder
-                .build_int_z_extend(dest_int, val_ty, "extend")
-                .unwrap()
+            bin.builder.build_int_z_extend(dest_int, val_ty, "extend").unwrap()
         };
-        bin.builder.build_store(val_ptr, store_val).unwrap();
-
-        let row_size_const = i32_ty.const_int(row_size as u64, false);
-        let data_len = i32_ty.const_int(2, false); // 2 x uint128_t = 256 bits
-
-        // Look up via idx256 secondary index.
-        let pk_out = bin.builder.build_alloca(i64_ty, "pk_out").unwrap();
-        let db_idx256_find = bin
-            .module
-            .get_function("db_idx256_find_secondary")
-            .unwrap();
-        let sec_iter = bin
+        let buf = bin
             .builder
-            .build_call(
-                db_idx256_find,
-                &[
-                    receiver.into(),
-                    receiver.into(),
-                    table_name.into(),
-                    slot_buf.into(),
-                    data_len.into(),
-                    pk_out.into(),
-                ],
-                "sec_iter",
-            )
-            .unwrap()
-            .try_as_basic_value()
-            .left()
-            .unwrap()
-            .into_int_value();
-
-        let found = bin
-            .builder
-            .build_int_compare(
-                IntPredicate::SGE,
-                sec_iter,
-                i32_ty.const_zero(),
-                "found",
+            .build_array_alloca(
+                bin.context.i8_type(),
+                i32_ty.const_int(byte_size as u64, false),
+                "store_buf",
             )
             .unwrap();
+        bin.builder.build_store(buf, store_val).unwrap();
 
-        let update_bb = bin.context.append_basic_block(function, "idx_update");
-        let insert_bb = bin.context.append_basic_block(function, "idx_insert");
-        let done_bb = bin.context.append_basic_block(function, "idx_done");
-
-        bin.builder
-            .build_conditional_branch(found, update_bb, insert_bb)
-            .unwrap();
-
-        // UPDATE existing row: write pk at offset 0, find primary, then update.
-        bin.builder.position_at_end(update_bb);
-        let pk = bin
-            .builder
-            .build_load(i64_ty, pk_out, "pk")
-            .unwrap()
-            .into_int_value();
-        // Write pk at offset 0 of row_buf.
-        bin.builder.build_store(row_buf, pk).unwrap();
-
-        let db_find = bin.module.get_function("db_find_i64").unwrap();
-        let pri_iter = bin
-            .builder
-            .build_call(
-                db_find,
-                &[
-                    receiver.into(),
-                    receiver.into(),
-                    table_name.into(),
-                    pk.into(),
-                ],
-                "pri_iter",
-            )
-            .unwrap()
-            .try_as_basic_value()
-            .left()
-            .unwrap()
-            .into_int_value();
-        let db_update = bin.module.get_function("db_update_i64").unwrap();
+        let helper = bin.module.get_function("__antelope_store_slot").unwrap();
         bin.builder
             .build_call(
-                db_update,
+                helper,
                 &[
-                    pri_iter.into(),
-                    ram_payer.into(),
-                    row_buf.into(),
-                    row_size_const.into(),
+                    slot_i256.into(),
+                    buf.into(),
+                    i32_ty.const_int(byte_size as u64, false).into(),
                 ],
                 "",
             )
             .unwrap();
-        bin.builder.build_unconditional_branch(done_bb).unwrap();
-
-        // INSERT new row with auto-increment primary key.
-        // Uses cached __next_pk global: UINT64_MAX sentinel means "compute from DB".
-        // After first compute, just increment the cached value for each insert.
-        bin.builder.position_at_end(insert_bb);
-
-        let pk_global = AntelopeTarget::get_next_pk_global(bin);
-        let cached_pk = bin
-            .builder
-            .build_load(i64_ty, pk_global.as_pointer_value(), "cached_pk")
-            .unwrap()
-            .into_int_value();
-
-        let sentinel = i64_ty.const_all_ones(); // UINT64_MAX
-        let need_init = bin
-            .builder
-            .build_int_compare(IntPredicate::EQ, cached_pk, sentinel, "need_init")
-            .unwrap();
-
-        let init_bb = bin.context.append_basic_block(function, "pk_init");
-        let use_cached_bb = bin.context.append_basic_block(function, "pk_cached");
-        let do_insert_bb = bin.context.append_basic_block(function, "do_insert");
-
-        bin.builder
-            .build_conditional_branch(need_init, init_bb, use_cached_bb)
-            .unwrap();
-
-        // INIT: compute next pk from database via db_end_i64/db_previous_i64.
-        bin.builder.position_at_end(init_bb);
-        let db_end = bin.module.get_function("db_end_i64").unwrap();
-        let end_iter = bin
-            .builder
-            .build_call(
-                db_end,
-                &[receiver.into(), receiver.into(), table_name.into()],
-                "end_iter",
-            )
-            .unwrap()
-            .try_as_basic_value()
-            .left()
-            .unwrap()
-            .into_int_value();
-
-        // db_end_i64 returns -1 for empty table, < -1 for valid end iterator.
-        let end_neg = bin
-            .builder
-            .build_int_compare(
-                IntPredicate::EQ,
-                end_iter,
-                i32_ty.const_int(u64::MAX, true), // -1
-                "end_neg",
-            )
-            .unwrap();
-
-        let empty_bb = bin.context.append_basic_block(function, "table_empty");
-        let has_rows_bb = bin.context.append_basic_block(function, "table_has_rows");
-        let init_done_bb = bin.context.append_basic_block(function, "pk_init_done");
-
-        bin.builder
-            .build_conditional_branch(end_neg, empty_bb, has_rows_bb)
-            .unwrap();
-
-        // Table empty: start at pk = 0.
-        bin.builder.position_at_end(empty_bb);
-        let pk_zero = i64_ty.const_zero();
-        bin.builder
-            .build_unconditional_branch(init_done_bb)
-            .unwrap();
-
-        // Table has rows: get last pk via db_previous_i64, use pk + 1.
-        bin.builder.position_at_end(has_rows_bb);
-        let last_pk_out = bin.builder.build_alloca(i64_ty, "last_pk_out").unwrap();
-        let db_previous = bin.module.get_function("db_previous_i64").unwrap();
-        bin.builder
-            .build_call(
-                db_previous,
-                &[end_iter.into(), last_pk_out.into()],
-                "",
-            )
-            .unwrap();
-        let last_pk = bin
-            .builder
-            .build_load(i64_ty, last_pk_out, "last_pk")
-            .unwrap()
-            .into_int_value();
-        let pk_from_db = bin
-            .builder
-            .build_int_add(last_pk, i64_ty.const_int(1, false), "pk_from_db")
-            .unwrap();
-        bin.builder
-            .build_unconditional_branch(init_done_bb)
-            .unwrap();
-
-        // Merge init result.
-        bin.builder.position_at_end(init_done_bb);
-        let init_pk = bin.builder.build_phi(i64_ty, "init_pk").unwrap();
-        init_pk.add_incoming(&[(&pk_zero, empty_bb), (&pk_from_db, has_rows_bb)]);
-        let init_pk_val = init_pk.as_basic_value().into_int_value();
-        bin.builder
-            .build_unconditional_branch(do_insert_bb)
-            .unwrap();
-
-        // USE CACHED: just use the cached value directly.
-        bin.builder.position_at_end(use_cached_bb);
-        bin.builder
-            .build_unconditional_branch(do_insert_bb)
-            .unwrap();
-
-        // Do the actual insert with the chosen pk, then increment __next_pk.
-        bin.builder.position_at_end(do_insert_bb);
-        let new_pk = bin.builder.build_phi(i64_ty, "new_pk").unwrap();
-        new_pk.add_incoming(&[(&init_pk_val, init_done_bb), (&cached_pk, use_cached_bb)]);
-        let new_pk_val = new_pk.as_basic_value().into_int_value();
-
-        // Write new_pk at offset 0 of row_buf.
-        bin.builder.build_store(row_buf, new_pk_val).unwrap();
-
-        // Increment and store back to __next_pk for next insert.
-        let next_pk_inc = bin
-            .builder
-            .build_int_add(new_pk_val, i64_ty.const_int(1, false), "next_pk_inc")
-            .unwrap();
-        bin.builder
-            .build_store(pk_global.as_pointer_value(), next_pk_inc)
-            .unwrap();
-
-        // db_store_i64(scope, table, payer, id, data, len)
-        let db_store = bin.module.get_function("db_store_i64").unwrap();
-        bin.builder
-            .build_call(
-                db_store,
-                &[
-                    receiver.into(),
-                    table_name.into(),
-                    ram_payer.into(),
-                    new_pk_val.into(),
-                    row_buf.into(),
-                    row_size_const.into(),
-                ],
-                "",
-            )
-            .unwrap();
-
-        // db_idx256_store(scope, table, payer, id, data, data_len)
-        let db_idx256_store = bin.module.get_function("db_idx256_store").unwrap();
-        bin.builder
-            .build_call(
-                db_idx256_store,
-                &[
-                    receiver.into(),
-                    table_name.into(),
-                    ram_payer.into(),
-                    new_pk_val.into(),
-                    slot_buf.into(),
-                    data_len.into(),
-                ],
-                "",
-            )
-            .unwrap();
-
-        bin.builder.build_unconditional_branch(done_bb).unwrap();
-
-        bin.builder.position_at_end(done_bb);
     }
 
     /// Delete a value from Antelope table storage via idx256 secondary index.
@@ -1048,7 +602,20 @@ impl<'a> TargetRuntime<'a> for AntelopeTarget {
 
     fn return_empty_abi(&self, bin: &Binary) {}
 
-    fn return_code<'b>(&self, bin: &'b Binary, ret: IntValue<'b>) {}
+    fn return_code<'b>(&self, bin: &'b Binary, _ret: IntValue<'b>) {
+        // Antelope has no selector return-code path — the real entrypoint is the
+        // hand-written `apply`, so `Instr::ReturnCode` only appears in the inherited
+        // (dead) dispatch CFGs. Still, this must emit a terminator: an empty body left
+        // the `fb_or_recv` block unterminated, producing invalid IR that crashed the
+        // backend at -O none/less (it was only masked at -O default by global_dce).
+        // Mirror the Polkadot target: abort via assert_failure, which ends in unreachable.
+        let ptr_null = bin
+            .context
+            .ptr_type(inkwell::AddressSpace::default())
+            .const_null();
+        let zero = bin.context.i32_type().const_zero();
+        self.assert_failure(bin, ptr_null, zero);
+    }
 
     fn assert_failure(&self, bin: &Binary, data: PointerValue, length: IntValue) {
         let eosio_assert = bin.module.get_function("eosio_assert").unwrap();
@@ -1530,21 +1097,13 @@ impl<'a> TargetRuntime<'a> for AntelopeTarget {
                     .collect();
 
                 // Pass 1: compute total packed byte count.
+                // Fixed-size widths come from the SHARED datastream_fixed_size (same
+                // authority as the deserializer), so pack can never drift from it.
+                // None = variable-length (string/bytes): varuint32(len) + raw bytes.
                 let mut total = i32_ty.const_int(0, false);
                 for (ty, val) in &arg_vals {
-                    let fixed: Option<u64> = match ty {
-                        crate::sema::ast::Type::Bool
-                        | crate::sema::ast::Type::Int(8)
-                        | crate::sema::ast::Type::Uint(8) => Some(1),
-                        crate::sema::ast::Type::Int(16) | crate::sema::ast::Type::Uint(16) => Some(2),
-                        crate::sema::ast::Type::Int(32) | crate::sema::ast::Type::Uint(32) => Some(4),
-                        crate::sema::ast::Type::Int(64) | crate::sema::ast::Type::Uint(64) => Some(8),
-                        crate::sema::ast::Type::Int(128) | crate::sema::ast::Type::Uint(128) => Some(16),
-                        crate::sema::ast::Type::Int(256) | crate::sema::ast::Type::Uint(256) => Some(32),
-                        crate::sema::ast::Type::Address(_) => Some(20),
-                        crate::sema::ast::Type::String | crate::sema::ast::Type::DynamicBytes => None,
-                        other => panic!("antelope.pack: unsupported type {:?}", other),
-                    };
+                    let fixed: Option<u64> =
+                        AntelopeTarget::datastream_fixed_size(ty, bin).map(|n| n as u64);
                     if let Some(n) = fixed {
                         total = bin.builder.build_int_add(total, i32_ty.const_int(n, false), "").unwrap();
                     } else {
@@ -1601,13 +1160,6 @@ impl<'a> TargetRuntime<'a> for AntelopeTarget {
                             bin.builder.build_store(ptr, byte_val).unwrap();
                             offset = bin.builder.build_int_add(offset, i32_ty.const_int(1, false), "").unwrap();
                         }
-                        crate::sema::ast::Type::Int(8) | crate::sema::ast::Type::Uint(8) => write_int!(1),
-                        crate::sema::ast::Type::Int(16) | crate::sema::ast::Type::Uint(16) => write_int!(2),
-                        crate::sema::ast::Type::Int(32) | crate::sema::ast::Type::Uint(32) => write_int!(4),
-                        crate::sema::ast::Type::Int(64) | crate::sema::ast::Type::Uint(64) => write_int!(8),
-                        crate::sema::ast::Type::Int(128) | crate::sema::ast::Type::Uint(128) => write_int!(16),
-                        crate::sema::ast::Type::Int(256) | crate::sema::ast::Type::Uint(256) => write_int!(32),
-                        crate::sema::ast::Type::Address(_) => write_int!(20),
                         crate::sema::ast::Type::String | crate::sema::ast::Type::DynamicBytes => {
                             // Write varuint32(len) then copy bytes.
                             let data_len = bin.vector_len(*val);
@@ -1626,7 +1178,14 @@ impl<'a> TargetRuntime<'a> for AntelopeTarget {
                             let field_total = bin.builder.build_int_add(vi_sz, data_len, "").unwrap();
                             offset = bin.builder.build_int_add(offset, field_total, "").unwrap();
                         }
-                        _ => unreachable!(),
+                        // Every other supported type is fixed-size (int/uint of any
+                        // width, bytesN, address, enum, value): write its N raw
+                        // little-endian bytes. Size from the shared authority.
+                        _ => {
+                            let n = AntelopeTarget::datastream_fixed_size(ty, bin)
+                                .expect("antelope.pack: variable-length type in fixed branch") as u64;
+                            write_int!(n);
+                        }
                     }
                 }
 
