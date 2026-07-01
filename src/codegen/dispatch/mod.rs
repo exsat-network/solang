@@ -19,5 +19,12 @@ pub(super) fn function_dispatch(
             polkadot::function_dispatch(contract_no, all_cfg, ns, opt)
         }
         Target::Soroban => soroban::function_dispatch(contract_no, all_cfg, ns, opt),
+        // Antelope's entry point is the hand-written `apply` (see emit/antelope), which
+        // dispatches actions by name — it does not use these selector-based dispatch CFGs.
+        // Generating the Polkadot ones only emitted dead functions whose Polkadot-specific
+        // terminators (ReturnCode / the ReturnData success path) Antelope's emit doesn't
+        // lower, leaving blocks unterminated → invalid IR that crashed the backend at
+        // -O none/less (masked at -O default only because global_dce drops dead functions).
+        Target::Antelope => vec![],
     }
 }

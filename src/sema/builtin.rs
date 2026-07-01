@@ -36,7 +36,7 @@ pub struct Prototype {
 }
 
 // A list of all Solidity builtins functions
-pub static BUILTIN_FUNCTIONS: Lazy<[Prototype; 29]> = Lazy::new(|| {
+pub static BUILTIN_FUNCTIONS: Lazy<[Prototype; 58]> = Lazy::new(|| { // 29 original + 12 Antelope + 17 table/decode
     [
         Prototype {
             builtin: Builtin::ExtendInstanceTtl,
@@ -367,6 +367,328 @@ pub static BUILTIN_FUNCTIONS: Lazy<[Prototype; 29]> = Lazy::new(|| {
             ret: vec![],
             target: vec![Target::Soroban],
             doc: "Authorizes sub-contract calls for the next contract call on behalf of the current contract.",
+            constant: false,
+        },
+        Prototype {
+            builtin: Builtin::AntelopeRequireAuth,
+            namespace: Some("antelope"),
+            method: vec![],
+            name: "requireAuth",
+            params: vec![Type::Uint(64)],
+            ret: vec![],
+            target: vec![Target::Antelope],
+            doc: "Require authorization from the given Antelope account. Aborts if not authorized.",
+            constant: false,
+        },
+        Prototype {
+            builtin: Builtin::AntelopeSelf,
+            namespace: Some("antelope"),
+            method: vec![],
+            name: "self",
+            params: vec![],
+            ret: vec![Type::Uint(64)],
+            target: vec![Target::Antelope],
+            doc: "Returns the current contract's Antelope account name as uint64.",
+            constant: false,
+        },
+        Prototype {
+            builtin: Builtin::AntelopeCode,
+            namespace: Some("antelope"),
+            method: vec![],
+            name: "code",
+            params: vec![],
+            ret: vec![Type::Uint(64)],
+            target: vec![Target::Antelope],
+            doc: "Returns the code account of the current action. Equals receiver() on direct calls; differs on notifications (require_recipient).",
+            constant: false,
+        },
+        Prototype {
+            builtin: Builtin::AntelopeName,
+            namespace: Some("antelope"),
+            method: vec![],
+            name: "name",
+            params: vec![Type::String],
+            ret: vec![Type::Uint(64)],
+            target: vec![Target::Antelope],
+            doc: "Encode a string literal as an Antelope eosio::name uint64 at compile time.",
+            constant: true,
+        },
+        Prototype {
+            builtin: Builtin::AntelopeRequireRecipient,
+            namespace: Some("antelope"),
+            method: vec![],
+            name: "requireRecipient",
+            params: vec![Type::Uint(64)],
+            ret: vec![],
+            target: vec![Target::Antelope],
+            doc: "Send a notification to the given account. The account's contract will receive the current action.",
+            constant: false,
+        },
+        Prototype {
+            builtin: Builtin::AntelopeCall,
+            namespace: Some("antelope"),
+            method: vec![],
+            name: "call",
+            params: vec![Type::Uint(64), Type::Uint(64), Type::DynamicBytes],
+            ret: vec![],
+            target: vec![Target::Antelope],
+            doc: "Send an inline action to another contract with self@active auth. Args: contract (uint64), action_name (uint64), packed_data (bytes).",
+            constant: false,
+        },
+        Prototype {
+            builtin: Builtin::AntelopeCallAuth,
+            namespace: Some("antelope"),
+            method: vec![],
+            name: "callauth",
+            params: vec![Type::Uint(64), Type::Uint(64), Type::DynamicBytes, Type::Uint(64), Type::Uint(64)],
+            ret: vec![],
+            target: vec![Target::Antelope],
+            doc: "Send an inline action with explicit auth. Args: contract, action_name, data, actor, permission.",
+            constant: false,
+        },
+        Prototype {
+            builtin: Builtin::AntelopeSetPayer,
+            namespace: Some("antelope"),
+            method: vec![],
+            name: "setpayer",
+            params: vec![Type::Uint(64)],
+            ret: vec![],
+            target: vec![Target::Antelope],
+            doc: "Set the RAM payer for subsequent storage operations. Defaults to self if not called.",
+            constant: false,
+        },
+        Prototype {
+            builtin: Builtin::AntelopePack,
+            namespace: Some("antelope"),
+            method: vec![],
+            name: "pack",
+            params: vec![],
+            ret: vec![Type::DynamicBytes],
+            target: vec![Target::Antelope],
+            doc: "Pack arguments into Antelope CDT format (little-endian integers, varuint32-prefixed strings). Variadic: accepts any number of typed arguments.",
+            constant: false,
+        },
+        Prototype {
+            builtin: Builtin::AntelopeHasAuth,
+            namespace: Some("antelope"),
+            method: vec![],
+            name: "hasAuth",
+            params: vec![Type::Uint(64)],
+            ret: vec![Type::Bool],
+            target: vec![Target::Antelope],
+            doc: "Returns true if the transaction includes authorization for the given Antelope account. Does not abort on failure.",
+            constant: false,
+        },
+        Prototype {
+            builtin: Builtin::AntelopeRequireAuth2,
+            namespace: Some("antelope"),
+            method: vec![],
+            name: "requireAuth2",
+            params: vec![Type::Uint(64), Type::Uint(64)],
+            ret: vec![],
+            target: vec![Target::Antelope],
+            doc: "Require explicit permission-level authorization. Args: account (uint64), permission (uint64, e.g. antelope.name(\"active\")).",
+            constant: false,
+        },
+        Prototype {
+            builtin: Builtin::AntelopeTimestamp,
+            namespace: Some("antelope"),
+            method: vec![],
+            name: "timestamp",
+            params: vec![],
+            ret: vec![Type::Uint(64)],
+            target: vec![Target::Antelope],
+            doc: "Returns the current block time as microseconds since Unix epoch (current_time() host function).",
+            constant: false,
+        },
+        // --- Decode helpers ---
+        Prototype {
+            builtin: Builtin::AntelopeToUint64,
+            namespace: Some("antelope"),
+            method: vec![],
+            name: "toUint64",
+            params: vec![Type::DynamicBytes, Type::Uint(32)],
+            ret: vec![Type::Uint(64)],
+            target: vec![Target::Antelope],
+            doc: "Read 8 bytes little-endian from bytes buffer at offset, returns uint64.",
+            constant: false,
+        },
+        Prototype {
+            builtin: Builtin::AntelopeToInt64,
+            namespace: Some("antelope"),
+            method: vec![],
+            name: "toInt64",
+            params: vec![Type::DynamicBytes, Type::Uint(32)],
+            ret: vec![Type::Int(64)],
+            target: vec![Target::Antelope],
+            doc: "Read 8 bytes little-endian from bytes buffer at offset, returns int64.",
+            constant: false,
+        },
+        Prototype {
+            builtin: Builtin::AntelopeToUint32,
+            namespace: Some("antelope"),
+            method: vec![],
+            name: "toUint32",
+            params: vec![Type::DynamicBytes, Type::Uint(32)],
+            ret: vec![Type::Uint(32)],
+            target: vec![Target::Antelope],
+            doc: "Read 4 bytes little-endian from bytes buffer at offset, returns uint32.",
+            constant: false,
+        },
+        Prototype {
+            builtin: Builtin::AntelopeToUint128,
+            namespace: Some("antelope"),
+            method: vec![],
+            name: "toUint128",
+            params: vec![Type::DynamicBytes, Type::Uint(32)],
+            ret: vec![Type::Uint(128)],
+            target: vec![Target::Antelope],
+            doc: "Read 16 bytes little-endian from bytes buffer at offset, returns uint128.",
+            constant: false,
+        },
+        Prototype {
+            builtin: Builtin::AntelopeToBytes32,
+            namespace: Some("antelope"),
+            method: vec![],
+            name: "toBytes32",
+            params: vec![Type::DynamicBytes, Type::Uint(32)],
+            ret: vec![Type::Bytes(32)],
+            target: vec![Target::Antelope],
+            doc: "Read 32 bytes from bytes buffer at offset, returns bytes32.",
+            constant: false,
+        },
+        Prototype {
+            builtin: Builtin::AntelopeToString,
+            namespace: Some("antelope"),
+            method: vec![],
+            name: "toString",
+            params: vec![Type::DynamicBytes, Type::Uint(32)],
+            ret: vec![Type::String],
+            target: vec![Target::Antelope],
+            doc: "Read varuint32-prefixed string from bytes buffer at offset.",
+            constant: false,
+        },
+        // --- Table read builtins ---
+        Prototype {
+            builtin: Builtin::AntelopeDbFind,
+            namespace: Some("antelope"),
+            method: vec![],
+            name: "dbFind",
+            params: vec![Type::Uint(64), Type::Uint(64), Type::Uint(64), Type::Uint(64)],
+            ret: vec![Type::Int(32)],
+            target: vec![Target::Antelope],
+            doc: "Find a row by primary key. Args: code, scope, table, pk. Returns iterator (<0 if not found).",
+            constant: false,
+        },
+        Prototype {
+            builtin: Builtin::AntelopeDbGet,
+            namespace: Some("antelope"),
+            method: vec![],
+            name: "dbGet",
+            params: vec![Type::Int(32)],
+            ret: vec![Type::DynamicBytes],
+            target: vec![Target::Antelope],
+            doc: "Read row data from an iterator. Returns raw bytes.",
+            constant: false,
+        },
+        Prototype {
+            builtin: Builtin::AntelopeDbNext,
+            namespace: Some("antelope"),
+            method: vec![],
+            name: "dbNext",
+            params: vec![Type::Int(32)],
+            ret: vec![Type::Int(32)],
+            target: vec![Target::Antelope],
+            doc: "Advance iterator to next row. Returns new iterator (<0 if end). Primary key cached in lastPk().",
+            constant: false,
+        },
+        Prototype {
+            builtin: Builtin::AntelopeDbLowerbound,
+            namespace: Some("antelope"),
+            method: vec![],
+            name: "dbLowerbound",
+            params: vec![Type::Uint(64), Type::Uint(64), Type::Uint(64), Type::Uint(64)],
+            ret: vec![Type::Int(32)],
+            target: vec![Target::Antelope],
+            doc: "Find first row with pk >= id. Args: code, scope, table, id. Returns iterator.",
+            constant: false,
+        },
+        Prototype {
+            builtin: Builtin::AntelopeLastPk,
+            namespace: Some("antelope"),
+            method: vec![],
+            name: "lastPk",
+            params: vec![],
+            ret: vec![Type::Uint(64)],
+            target: vec![Target::Antelope],
+            doc: "Returns the primary key cached by the last dbNext/dbIdx*Find/dbIdx*Lowerbound call.",
+            constant: false,
+        },
+        // --- Secondary index builtins ---
+        Prototype {
+            builtin: Builtin::AntelopeDbIdx64Find,
+            namespace: Some("antelope"),
+            method: vec![],
+            name: "dbIdx64Find",
+            params: vec![Type::Uint(64), Type::Uint(64), Type::Uint(64), Type::Uint(64), Type::Uint(64)],
+            ret: vec![Type::Int(32)],
+            target: vec![Target::Antelope],
+            doc: "Find by idx64 secondary key. Args: code, scope, table, indexNum, key. Returns iterator. PK in lastPk().",
+            constant: false,
+        },
+        Prototype {
+            builtin: Builtin::AntelopeDbIdx64Lowerbound,
+            namespace: Some("antelope"),
+            method: vec![],
+            name: "dbIdx64Lowerbound",
+            params: vec![Type::Uint(64), Type::Uint(64), Type::Uint(64), Type::Uint(64), Type::Uint(64)],
+            ret: vec![Type::Int(32)],
+            target: vec![Target::Antelope],
+            doc: "Find first idx64 entry >= key. Args: code, scope, table, indexNum, key. Returns iterator. PK in lastPk().",
+            constant: false,
+        },
+        Prototype {
+            builtin: Builtin::AntelopeDbIdx128Find,
+            namespace: Some("antelope"),
+            method: vec![],
+            name: "dbIdx128Find",
+            params: vec![Type::Uint(64), Type::Uint(64), Type::Uint(64), Type::Uint(64), Type::Uint(128)],
+            ret: vec![Type::Int(32)],
+            target: vec![Target::Antelope],
+            doc: "Find by idx128 secondary key. Args: code, scope, table, indexNum, key. Returns iterator. PK in lastPk().",
+            constant: false,
+        },
+        Prototype {
+            builtin: Builtin::AntelopeDbIdx128Lowerbound,
+            namespace: Some("antelope"),
+            method: vec![],
+            name: "dbIdx128Lowerbound",
+            params: vec![Type::Uint(64), Type::Uint(64), Type::Uint(64), Type::Uint(64), Type::Uint(128)],
+            ret: vec![Type::Int(32)],
+            target: vec![Target::Antelope],
+            doc: "Find first idx128 entry >= key. Args: code, scope, table, indexNum, key. Returns iterator. PK in lastPk().",
+            constant: false,
+        },
+        Prototype {
+            builtin: Builtin::AntelopeDbIdx256Find,
+            namespace: Some("antelope"),
+            method: vec![],
+            name: "dbIdx256Find",
+            params: vec![Type::Uint(64), Type::Uint(64), Type::Uint(64), Type::Uint(64), Type::Bytes(32)],
+            ret: vec![Type::Int(32)],
+            target: vec![Target::Antelope],
+            doc: "Find by idx256 secondary key. Args: code, scope, table, indexNum, key (bytes32). Returns iterator. PK in lastPk().",
+            constant: false,
+        },
+        Prototype {
+            builtin: Builtin::AntelopeDbIdx256Lowerbound,
+            namespace: Some("antelope"),
+            method: vec![],
+            name: "dbIdx256Lowerbound",
+            params: vec![Type::Uint(64), Type::Uint(64), Type::Uint(64), Type::Uint(64), Type::Bytes(32)],
+            ret: vec![Type::Int(32)],
+            target: vec![Target::Antelope],
+            doc: "Find first idx256 entry >= key. Args: code, scope, table, indexNum, key (bytes32). Returns iterator. PK in lastPk().",
             constant: false,
         },
     ]
@@ -942,6 +1264,14 @@ pub fn builtin_var(
                     ),
                 ));
             }
+            if ns.target == Target::Antelope && p.builtin == Builtin::Value {
+                diagnostics.push(Diagnostic::error(
+                    *loc,
+                    String::from(
+                        "Antelope does not support value transfers in calls. Use explicit token transfer actions instead.",
+                    ),
+                ));
+            }
             if ns.target == Target::Solana && p.builtin == Builtin::Sender {
                 diagnostics.push(Diagnostic::error(
                     *loc,
@@ -1145,6 +1475,36 @@ pub(super) fn resolve_namespace_call(
             loc: *loc,
             tys: Vec::new(),
             kind: Builtin::AuthAsCurrContract,
+            args: resolved_args,
+        });
+    }
+
+    // antelope.pack(...) is variadic — resolve all args with unknown type
+    if namespace == "antelope" && name == "pack" {
+        let mut resolved_args = Vec::new();
+        for arg in args {
+            let mut expr = expression(arg, context, ns, symtable, diagnostics, ResolveTo::Unknown)?;
+            // Byte/string literals come through as BytesLiteral{ty:Bytes(0)} — cast to String
+            // so the emit layer sees Type::String, not a 0-bit integer.
+            if let Expression::BytesLiteral { .. } = &expr {
+                expr = expr.cast(&arg.loc(), &Type::String, true, ns, diagnostics)?;
+            }
+            // StorageRef args (state variables) need an explicit load, since
+            // ResolveTo::Unknown doesn't trigger the implicit dereference.
+            if let Type::StorageRef(_, inner_ty) = expr.ty() {
+                expr = Expression::StorageLoad {
+                    loc: arg.loc(),
+                    ty: *inner_ty,
+                    expr: Box::new(expr),
+                };
+            }
+            resolved_args.push(expr);
+
+        }
+        return Ok(Expression::Builtin {
+            loc: *loc,
+            tys: vec![Type::DynamicBytes],
+            kind: Builtin::AntelopePack,
             args: resolved_args,
         });
     }

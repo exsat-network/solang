@@ -1077,6 +1077,86 @@ pub fn expression(
         }
         ast::Expression::Builtin {
             loc,
+            kind: ast::Builtin::AntelopeName,
+            args,
+            ..
+        } => {
+            // Constant-fold antelope.name("string") → u64 at compile time.
+            // Extract the string literal from the argument.
+            // Solang may represent string literals as BytesLiteral or AllocDynamicBytes.
+            let name_str = match &args[0] {
+                ast::Expression::BytesLiteral { value, .. } => {
+                    String::from_utf8(value.clone()).unwrap_or_default()
+                }
+                ast::Expression::AllocDynamicBytes {
+                    init: Some(value), ..
+                } => String::from_utf8(value.clone()).unwrap_or_default(),
+                _ => String::new(),
+            };
+            let encoded = crate::emit::antelope::string_to_name(&name_str);
+            Expression::NumberLiteral {
+                loc: *loc,
+                ty: Type::Uint(64),
+                value: encoded.into(),
+            }
+        }
+        ast::Expression::Builtin {
+            loc,
+            kind: ast::Builtin::AntelopeRequireAuth,
+            args,
+            ..
+        } => {
+            let arg = expression(&args[0], cfg, contract_no, func, ns, vartab, opt);
+            let res = vartab.temp_anonymous(&Type::Uint(64));
+            cfg.add(
+                vartab,
+                Instr::Set {
+                    loc: *loc,
+                    res,
+                    expr: Expression::Builtin {
+                        loc: *loc,
+                        tys: vec![Type::Uint(64)],
+                        kind: Builtin::AntelopeRequireAuth,
+                        args: vec![arg],
+                    },
+                },
+            );
+            Expression::Poison
+        }
+        // Void side-effect builtins: must be wrapped in Instr::Set so LLVM emits them.
+        // Pattern: dummy Uint(64) return type, temp variable discarded, returns Poison.
+        ast::Expression::Builtin {
+            loc,
+            kind: kind @ (ast::Builtin::AntelopeCall
+                | ast::Builtin::AntelopeCallAuth
+                | ast::Builtin::AntelopeRequireRecipient
+                | ast::Builtin::AntelopeSetPayer
+                | ast::Builtin::AntelopeRequireAuth2),
+            args,
+            ..
+        } => {
+            let lowered_args: Vec<Expression> = args
+                .iter()
+                .map(|a| expression(a, cfg, contract_no, func, ns, vartab, opt))
+                .collect();
+            let res = vartab.temp_anonymous(&Type::Uint(64));
+            cfg.add(
+                vartab,
+                Instr::Set {
+                    loc: *loc,
+                    res,
+                    expr: Expression::Builtin {
+                        loc: *loc,
+                        tys: vec![Type::Uint(64)],
+                        kind: kind.into(),
+                        args: lowered_args,
+                    },
+                },
+            );
+            Expression::Poison
+        }
+        ast::Expression::Builtin {
+            loc,
             tys,
             kind,
             args,
@@ -3827,7 +3907,7 @@ fn array_subscript(
                 expr: Box::new(array),
                 index: Box::new(index),
             },
-            Target::Polkadot { .. } => Expression::Keccak256 {
+            Target::Polkadot { .. } | Target::Antelope => Expression::Keccak256 {
                 loc: *loc,
                 ty: array_ty.clone(),
                 exprs: vec![array, index],

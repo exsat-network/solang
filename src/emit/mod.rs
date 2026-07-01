@@ -26,6 +26,7 @@ pub mod solana;
 
 #[cfg(feature = "soroban")]
 pub mod soroban;
+pub mod antelope;
 mod storage;
 mod strings;
 

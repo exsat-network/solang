@@ -19,6 +19,30 @@ use solang_parser::{
     pt::{CodeLocation, OptionalCodeLocation},
 };
 
+/// Whether a parameter type can be deserialized from Antelope action data.
+///
+/// Mirrors exactly the type set the emitter's action-data deserialization handles
+/// (`datastream_fixed_size` in `emit/antelope/mod.rs` returns `Some` for the
+/// fixed-size arms and `None` for `string`/`bytes`, which the emitter reads as a
+/// varuint32 length + bytes). Every other type panics the emitter, so we keep this
+/// predicate deliberately narrow — anything it does not list is rejected with a
+/// clean diagnostic in `contract_function` rather than aborting codegen.
+fn antelope_action_param_supported(ty: &Type) -> bool {
+    matches!(
+        ty,
+        Type::Bool
+            | Type::Uint(_)
+            | Type::Int(_)
+            | Type::Bytes(_)
+            | Type::Enum(_)
+            | Type::Value
+            | Type::Contract(_)
+            | Type::Address(_)
+            | Type::String
+            | Type::DynamicBytes
+    )
+}
+
 /// Resolve function declaration in a contract
 pub fn contract_function(
     contract: &ContractDefinition,
@@ -480,9 +504,84 @@ pub fn contract_function(
     fdecl.is_override = is_override;
     fdecl.has_body = func.body.is_some();
 
+    // Antelope does not support payable functions.
+    if ns.target == Target::Antelope && fdecl.is_payable() {
+        ns.diagnostics.push(Diagnostic::error(
+            func.loc_prototype,
+            "Antelope does not support payable functions. Use explicit token transfer actions instead."
+                .to_string(),
+        ));
+        return None;
+    }
+
+    // Antelope action names derive from public/external function names via the
+    // eosio::name charset (lowercase a-z, digits 1-5, dot; max 12 chars). Any
+    // character outside that set — or a name longer than 12 chars — is silently
+    // dropped/truncated when the action name is encoded, which mangles the
+    // on-chain name and can collide two functions onto the same action (the
+    // second dispatch branch then becomes unreachable). Reject it at compile time
+    // rather than letting it mis-dispatch or fail at `cleos set abi`. Case-only
+    // changes (idiomatic camelCase like `putHash`) are fine — those normalize
+    // predictably to lowercase, so `action == lowered` and no error fires.
+    if ns.target == Target::Antelope
+        && fdecl.is_public()
+        && func.ty == pt::FunctionTy::Function
+    {
+        let lowered: String = fdecl.id.name.chars().flat_map(char::to_lowercase).collect();
+        let action = crate::abi::antelope::normalize_action_name(&fdecl.id.name);
+        if action != lowered {
+            ns.diagnostics.push(Diagnostic::error(
+                func.loc_prototype,
+                format!(
+                    "public function '{}' cannot be represented as an Antelope action name: \
+                     the eosio::name charset only allows lowercase a-z, digits 1-5 and dot, with \
+                     at most 12 characters. It would be truncated/mangled to '{}' (risking a \
+                     collision with another action). Rename it to fit the charset — camelCase is \
+                     fine, it lowercases to a predictable name.",
+                    fdecl.id.name, action
+                ),
+            ));
+        }
+
+        // Antelope action-data deserialization only handles fixed-size scalars
+        // (bool, intN/uintN, bytesN, enum, address) plus variable-length
+        // `string`/`bytes`. Compound parameters (dynamic arrays, structs, ...)
+        // are not implemented and previously aborted the emitter with an internal
+        // panic ("unsupported parameter type for action data deserialization").
+        // Reject them here with a clean diagnostic instead. Pass such data as
+        // `bytes` and decode it inside the action for now.
+        for param in fdecl.params.iter() {
+            if !antelope_action_param_supported(&param.ty) {
+                let loc = param.loc;
+                ns.diagnostics.push(Diagnostic::error(
+                    loc,
+                    format!(
+                        "parameter type '{}' is not supported for Antelope action '{}'. \
+                         Actions accept fixed-size scalars (bool, intN/uintN, bytesN, enum, \
+                         address), 'string' and 'bytes'; arrays, structs and other compound \
+                         types are not yet deserializable — pass the data as 'bytes' and decode \
+                         it in the action body.",
+                        param.ty.to_string(ns),
+                        action
+                    ),
+                ));
+            }
+        }
+    }
+
     function_prototype_annotations(&mut fdecl, annotations, ns);
 
     if func.ty == pt::FunctionTy::Constructor {
+        // Antelope has no deploy-time initialization.
+        if ns.target == Target::Antelope {
+            ns.diagnostics.push(Diagnostic::error(
+                func.loc_prototype,
+                "constructors are not supported on Antelope. Use an explicit init() action instead."
+                    .to_string(),
+            ));
+            return None;
+        }
+
         // In the eth solidity only one constructor is allowed
         if ns.target == Target::EVM {
             if let Some(prev_func_no) = ns.contracts[contract_no]
@@ -640,6 +739,10 @@ pub fn contract_function(
         let func_no = ns.functions.len();
 
         ns.functions.push(fdecl);
+
+        // Note: Antelope return values are passed via set_action_return_value (Leap 3.x+).
+        // Variable-length return types (string, bytes) are not yet serialized.
+
         ns.contracts[contract_no].functions.push(func_no);
 
         if let Some(Symbol::Function(ref mut v)) =

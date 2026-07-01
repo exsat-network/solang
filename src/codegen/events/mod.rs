@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
+mod antelope;
 mod polkadot;
 mod solana;
 
 use crate::codegen::cfg::ControlFlowGraph;
+use crate::codegen::events::antelope::AntelopeEventEmitter;
 use crate::codegen::events::polkadot::PolkadotEventEmitter;
 use crate::codegen::events::solana::SolanaEventEmitter;
 use crate::codegen::vartable::Vartable;
@@ -52,5 +54,7 @@ pub(super) fn new_event_emitter<'a>(
         }),
 
         Target::Soroban => todo!(),
+
+        Target::Antelope => Box::new(AntelopeEventEmitter { args, ns, event_no }),
     }
 }

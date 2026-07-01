@@ -1666,6 +1666,43 @@ pub(super) fn expression<'a, T: TargetRuntime<'a> + ?Sized>(
                 values.push((v, len, e.ty()));
             }
 
+            // Antelope: every keccak256 is an internal storage-slot derivation of the
+            // shape keccak(prev_256 ‖ key). For the common 2-operand fixed-size-key case,
+            // call the shared __map_slot helper instead of inlining the preimage build at
+            // every storage access — this keeps storage-heavy functions small. The
+            // preimage bytes are identical, so the resulting slot hash is unchanged.
+            let antelope_slot = bin.ns.target == Target::Antelope
+                && values.len() == 2
+                && values[0].0.is_int_value()
+                && values[0].0.into_int_value().get_type().get_bit_width() == 256
+                && values[1].0.is_int_value()
+                && values[1].0.into_int_value().get_type().get_bit_width() <= 256
+                && !matches!(values[1].2, Type::DynamicBytes | Type::String);
+
+            if antelope_slot {
+                let i256_ty = bin.context.custom_width_int_type(256);
+                let prev = values[0].0.into_int_value();
+                let key = values[1].0.into_int_value();
+                let key = if key.get_type().get_bit_width() == 256 {
+                    key
+                } else {
+                    bin.builder
+                        .build_int_z_extend(key, i256_ty, "key256")
+                        .unwrap()
+                };
+                return bin
+                    .builder
+                    .build_call(
+                        bin.module.get_function("__map_slot").unwrap(),
+                        &[prev.into(), key.into(), values[1].1.into()],
+                        "map_slot",
+                    )
+                    .unwrap()
+                    .try_as_basic_value()
+                    .left()
+                    .unwrap();
+            }
+
             //  now allocate a buffer
             let src = bin
                 .builder

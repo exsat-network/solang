@@ -36,6 +36,11 @@ fn evm_contracts() -> io::Result<()> {
     contract_tests("tests/contract_testcases/evm", Target::EVM)
 }
 
+#[test]
+fn antelope_contracts() -> io::Result<()> {
+    contract_tests("tests/contract_testcases/antelope", Target::Antelope)
+}
+
 fn contract_tests(file_path: &str, target: Target) -> io::Result<()> {
     let path = PathBuf::from(file_path);
     recurse_directory(path, target)
@@ -98,7 +103,7 @@ fn parse_file(path: PathBuf, target: Target) -> io::Result<()> {
 
             if contract.instantiable {
                 let code = match ns.target {
-                    Target::Solana | Target::Polkadot { .. } => {
+                    Target::Solana | Target::Polkadot { .. } | Target::Antelope => {
                         contract.emit(&ns, &Default::default(), contract_no)
                     }
                     Target::EVM => b"beep".to_vec(),
