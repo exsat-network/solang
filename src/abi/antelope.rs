@@ -5,6 +5,31 @@ use num_traits::ToPrimitive;
 use serde::Serialize;
 use solang_parser::pt::FunctionTy;
 
+/// Normalize a Solidity identifier into a valid eosio::name-compatible action name.
+///
+/// eosio::name only admits the charset `.`, `1`-`5`, `a`-`z` and at most 13 chars
+/// (12 used here for the 5-bit region). We therefore:
+///   1. lowercase first — eosio::name has no uppercase, so `putHash` must become
+///      `puthash`, NOT `putash` (dropping the uppercase byte silently mangles the
+///      name and can collide two functions);
+///   2. keep only the eosio charset — digits `0` and `6`-`9` are NOT valid
+///      eosio::name characters, so `putu8` normalizes to `putu`, matching what
+///      nodeos itself would do at `set abi` time;
+///   3. truncate to 12 characters.
+///
+/// This is the single authority for action-name derivation: the ABI's
+/// `actions[].name` (here) and the emitter's dispatch switch (`emit_apply`) must
+/// agree exactly, or dispatch silently fails to route. Event names follow the
+/// same charset in `codegen/events/antelope.rs`. Lives in the always-compiled
+/// `abi` module so `sema` can reach it without depending on the llvm-gated `emit`.
+pub fn normalize_action_name(name: &str) -> String {
+    name.chars()
+        .flat_map(char::to_lowercase)
+        .filter(|c| c.is_ascii_lowercase() || matches!(c, '1'..='5') || *c == '.')
+        .take(12)
+        .collect()
+}
+
 /// Type id used in `abi_extensions` to mark a Solang storage-layout blob.
 /// ASCII for 'S','L' (Solang). The payload is UTF-8 JSON; see [`AntelopeLayout`].
 pub const SOLANG_LAYOUT_EXT_TYPE: u16 = 0x534C;
@@ -57,11 +82,29 @@ pub struct AbiTable {
 
 /// One entry of the standard `abi_extensions: pair<uint16, bytes>[]` array.
 /// `data` is the hex-encoded payload (the standard wire form for the `bytes` field).
-#[derive(Serialize)]
+///
+/// fc's `extensions_type` is `vector<pair<uint16_t, vector<char>>>`, whose JSON
+/// representation is a 2-element tuple `[type, dataHex]` — NOT an object
+/// `{"type":…,"data":…}`. nodeos/fc cannot parse the object form and rejects
+/// `cleos set abi` with "Bad Cast: Invalid cast from object_type to Array", so we
+/// serialize as a tuple. (The struct keeps named fields for ergonomic construction
+/// and testing; only the wire form is a tuple.)
 pub struct AbiExtension {
-    #[serde(rename = "type")]
     pub ty: u16,
     pub data: String,
+}
+
+impl Serialize for AbiExtension {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeTuple;
+        let mut tup = serializer.serialize_tuple(2)?;
+        tup.serialize_element(&self.ty)?;
+        tup.serialize_element(&self.data)?;
+        tup.end()
+    }
 }
 
 /// Solang-private storage layout descriptor, packed into `abi_extensions`.
@@ -278,11 +321,8 @@ pub fn gen_abi(contract_no: usize, ns: &Namespace) -> AntelopeAbi {
         let func_name = &func.id.name;
 
         // Antelope action names are max 12 chars, lowercase + 1-5 + dot.
-        let action_name = func_name
-            .chars()
-            .filter(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == '.')
-            .take(12)
-            .collect::<String>();
+        // Shared normalizer keeps this identical to the emitter's dispatch switch.
+        let action_name = normalize_action_name(func_name);
 
         if action_name.is_empty() {
             continue;
@@ -597,6 +637,19 @@ mod tests {
         let ext = &abi.abi_extensions[0];
         assert_eq!(ext.ty, SOLANG_LAYOUT_EXT_TYPE);
 
+        // C5: the wire form must be a 2-element tuple `[type, dataHex]`, not an
+        // object `{"type":…,"data":…}` — fc's extensions_type is
+        // vector<pair<uint16,bytes>> and nodeos rejects the object form.
+        let wire: serde_json::Value =
+            serde_json::to_value(&abi.abi_extensions).expect("abi_extensions serializes");
+        let entry = &wire[0];
+        assert!(
+            entry.is_array(),
+            "abi_extensions entry must be a tuple array, got: {entry}"
+        );
+        assert_eq!(entry[0], SOLANG_LAYOUT_EXT_TYPE);
+        assert_eq!(entry[1], serde_json::Value::String(ext.data.clone()));
+
         // Decode and re-parse the layout JSON to verify the on-chain round-trip.
         // Use serde_json::Value so we don't have to add Deserialize impls just for the test.
         let bytes = hex::decode(&ext.data).expect("data must be hex");
@@ -612,6 +665,42 @@ mod tests {
         assert_eq!(vars[1]["kind"], "map");
         assert_eq!(vars[1]["keys"][0], "uint64");
         assert_eq!(vars[1]["type"], "uint256");
+    }
+
+    #[test]
+    fn normalize_action_name_lowercases_and_restricts_charset() {
+        // C1: camelCase lowercases (not drops uppercase) — `putHash` → `puthash`,
+        // NOT the old buggy `putash`/`setorker`.
+        assert_eq!(normalize_action_name("putHash"), "puthash");
+        assert_eq!(normalize_action_name("setWorker"), "setworker");
+        // Truncated to 12 chars.
+        assert_eq!(normalize_action_name("averylongfunctionname"), "averylongfun");
+    }
+
+    #[test]
+    fn abi_action_names_are_lowercased_not_dropped() {
+        // C1: an action named with camelCase must lowercase, not drop uppercase.
+        let abi = compile_to_abi(
+            r#"
+            contract C {
+                uint64 x;
+                function putHash(uint64 v) public { x = v; }
+                function setWorker(uint64 v) public { x = v; }
+            }
+            "#,
+        );
+        let names: Vec<&str> = abi.actions.iter().map(|a| a.name.as_str()).collect();
+        assert!(names.contains(&"puthash"), "actions: {names:?}");
+        assert!(names.contains(&"setworker"), "actions: {names:?}");
+    }
+
+    #[test]
+    fn abi_action_names_restrict_digits_to_eosio_charset() {
+        // C2: digits 0 and 6-9 are not valid eosio::name chars and are dropped;
+        // 1-5 are kept. `putu8` → `putu`, `slot12` → `slot12`.
+        assert_eq!(normalize_action_name("putu8"), "putu");
+        assert_eq!(normalize_action_name("slot12"), "slot12");
+        assert_eq!(normalize_action_name("get9"), "get");
     }
 
     #[test]

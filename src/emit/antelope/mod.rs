@@ -1264,11 +1264,8 @@ impl AntelopeTarget {
             let action_name = func_name.split("__").next().unwrap_or(func_name);
             // Normalize to eosio::name charset (lowercase + 1-5 + dot, max 12 chars)
             // to match the ABI action name generation.
-            let action_name_normalized: String = action_name
-                .chars()
-                .filter(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == '.')
-                .take(12)
-                .collect();
+            let action_name_normalized =
+                crate::abi::antelope::normalize_action_name(action_name);
             let action_encoded = string_to_name(&action_name_normalized);
 
             let action_const = i64_ty.const_int(action_encoded, false);
@@ -1527,8 +1524,12 @@ impl AntelopeTarget {
                                 };
                                 bin.builder
                                     .build_call(
+                                        // The runtime memcpy is declared as `__memcpy`
+                                        // (see declare_externals); a bare `memcpy` was
+                                        // never declared and panicked the multi-return
+                                        // path (e.g. a public struct-returning getter).
                                         bin.module
-                                            .get_function("memcpy")
+                                            .get_function("__memcpy")
                                             .unwrap(),
                                         &[
                                             dest.into(),

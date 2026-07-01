@@ -92,6 +92,7 @@ pub fn resolve(contracts: &[ContractDefinition], file_no: usize, ns: &mut ast::N
         check_inheritance(contract_no, ns);
         mangle_function_names(contract_no, ns);
         verify_unique_selector(contract_no, ns);
+        antelope_verify_unique_action_names(contract_no, ns);
         polkadot_requires_public_functions(contract_no, ns);
         unique_constructor_names(contract_no, ns);
         check_mangled_function_names(contract_no, ns);
@@ -1333,6 +1334,60 @@ fn verify_unique_selector(contract_no: usize, ns: &mut Namespace) {
             }
         } else {
             selectors.insert(selector, *func_no);
+        }
+    }
+
+    ns.diagnostics.append(&mut diagnostics);
+}
+
+/// Antelope: every public/external function becomes an action whose name is the
+/// eosio::name normalization of the Solidity function name (see
+/// `abi::antelope::normalize_action_name`). Two *distinct* functions can normalize
+/// to the same action name — via case-folding (`putHash` / `puthash`), overloading
+/// (`foo(uint64)` / `foo(string)`, both → `foo`), or charset stripping/truncation.
+/// The emitter's dispatch switch would then route only the first match, silently
+/// leaving the others unreachable. The per-function charset diagnostic (in
+/// `sema::functions`) rejects names that strip; this contract-level pass catches
+/// the collisions those miss — case-folding and overloads, where each individual
+/// name normalizes cleanly yet they land on the same action.
+fn antelope_verify_unique_action_names(contract_no: usize, ns: &mut Namespace) {
+    if ns.target != crate::Target::Antelope {
+        return;
+    }
+
+    let mut seen: HashMap<String, usize> = HashMap::new();
+    let mut diagnostics: Vec<Diagnostic> = Vec::new();
+
+    // Mirror the exact set of functions that `abi::antelope::gen_abi` turns into
+    // actions: public/external, non-constructor.
+    for func_no in ns.contracts[contract_no].all_functions.keys() {
+        let func = &ns.functions[*func_no];
+
+        if !func.is_public() || func.ty == FunctionTy::Constructor {
+            continue;
+        }
+
+        let action = crate::abi::antelope::normalize_action_name(&func.id.name);
+        // Empty (whole name stripped) is already reported per-function; skip here.
+        if action.is_empty() {
+            continue;
+        }
+
+        if let Some(other_no) = seen.get(&action) {
+            let other = &ns.functions[*other_no];
+            diagnostics.push(ast::Diagnostic::error_with_note(
+                func.loc_prototype,
+                format!(
+                    "function '{}' collides with '{}': both map to the Antelope action name '{}'. \
+                     Action names must be unique — rename one. (Function overloading is not \
+                     supported for Antelope actions, since an action carries no parameter signature.)",
+                    func.id.name, other.id.name, action
+                ),
+                other.loc_prototype,
+                format!("'{}' also maps to action '{}'", other.id.name, action),
+            ));
+        } else {
+            seen.insert(action, *func_no);
         }
     }
 
